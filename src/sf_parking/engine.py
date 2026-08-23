@@ -34,25 +34,43 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * EARTH_RADIUS_M * asin(sqrt(a))
 
 
+def _same_location(policy: MeterPolicy, meter: ParkingMeter) -> bool:
+    """Match policy to inventory using the identifiers SFMTA actually exposes."""
+    if meter.parking_space_id is not None and policy.parking_space_id is not None:
+        if meter.parking_space_id == policy.parking_space_id:
+            return True
+    return bool(meter.post_id and policy.post_id and meter.post_id == policy.post_id)
+
+
 def active_policy(
     policies: list[MeterPolicy],
     *,
-    parking_space_id: int,
+    meter: ParkingMeter,
     when: datetime,
 ) -> MeterPolicy | None:
-    day = when.strftime("%A").lower()
-    current = when.time()
     matches = [
-        p for p in policies
-        if p.parking_space_id == parking_space_id
-        and p.applies_on(day)
+        p
+        for p in policies
+        if _same_location(p, meter)
+        and p.applies_on(when.strftime("%A"))
         and (p.start_date is None or p.start_date <= when.date())
         and (p.end_date is None or when.date() <= p.end_date)
-        and p.start_time <= current < p.end_time
+        and p.start_time <= when.time() < p.end_time
     ]
     if not matches:
         return None
-    return min(matches, key=lambda p: (p.hourly_rate, p.time_limit_minutes or 10**9))
+
+    # Prefer explicit FREE/OP schedules over PRE when multiple records overlap;
+    # then prefer the lowest effective hourly rate and longest usable duration.
+    schedule_priority = {"FREE": 0, "OP": 1, "PRE": 2}
+    return min(
+        matches,
+        key=lambda p: (
+            schedule_priority.get((p.schedule_type or "").upper(), 9),
+            p.hourly_rate,
+            -(p.time_limit_minutes or 0),
+        ),
+    )
 
 
 def nearby(
@@ -76,7 +94,7 @@ def nearby(
             ParkingCandidate(
                 meter=meter,
                 distance_m=distance,
-                policy=active_policy(policies, parking_space_id=meter.parking_space_id, when=when),
+                policy=active_policy(policies, meter=meter, when=when),
             )
         )
 
