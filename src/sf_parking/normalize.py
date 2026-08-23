@@ -39,12 +39,16 @@ def _time(value: Any) -> time:
 
 
 def normalize_meter(row: dict[str, Any]) -> ParkingMeter:
+    """Normalize an inventory row.
+
+    The current SFMTA inventory does not expose ParkingSpaceID in every row;
+    the stable cross-dataset identifier available here is PostID. Policy rows
+    carry both PostID and ParkingSpaceID, so PostID is retained for the join.
+    """
     space_id = row.get("parking_space_id", row.get("parkingspaceid"))
-    if space_id in (None, ""):
-        raise ValueError("meter row has no ParkingSpaceID")
     active_flag = str(row.get("active_meter_flag", row.get("active_met", ""))).upper()
     return ParkingMeter(
-        parking_space_id=int(float(space_id)),
+        parking_space_id=_int(space_id),
         post_id=row.get("post_id", row.get("postid")),
         latitude=_float(row, "latitude"),
         longitude=_float(row, "longitude"),
@@ -58,14 +62,13 @@ def normalize_meter(row: dict[str, Any]) -> ParkingMeter:
 
 def normalize_policy(row: dict[str, Any]) -> MeterPolicy:
     space_id = row.get("parkingspaceid", row.get("parking_space_id"))
-    if space_id in (None, ""):
-        raise ValueError("policy row has no ParkingSpaceID")
     return MeterPolicy(
-        parking_space_id=int(float(space_id)),
+        parking_space_id=_int(space_id),
+        post_id=row.get("postid", row.get("post_id")),
         day_of_week=str(row["dayofweek"]),
         start_time=_time(row["starttime"]),
         end_time=_time(row["endtime"]),
-        hourly_rate=float(row.get("hourlyrate", 0)),
+        hourly_rate=float(row.get("hourlyrate") or 0),
         time_limit_minutes=_int(row.get("timelimitminutes")),
         start_date=_date(row.get("startdate")),
         end_date=_date(row.get("enddate")),
