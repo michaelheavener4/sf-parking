@@ -1,3 +1,5 @@
+from datetime import time
+
 from sf_parking.normalize import normalize_meter, normalize_policy
 
 
@@ -34,3 +36,32 @@ def test_normalize_policy_handles_free_schedule_without_rate() -> None:
     assert policy.hourly_rate == 0
     assert policy.schedule_type == "FREE"
     assert policy.parking_space_id == 123238
+
+
+def test_normalize_policy_accepts_sfmta_midnight_sentinel() -> None:
+    policy = normalize_policy(
+        {
+            "dayofweek": "Mo",
+            "starttime": "9:00",
+            "endtime": "24:00",
+            "parkingspaceid": "123238",
+            "postid": "102-02990",
+            "scheduletype": "OP",
+            "hourlyrate": "5.75",
+        }
+    )
+    assert policy.end_time == time.max
+
+
+def test_normalize_policy_accepts_midnight_as_zero() -> None:
+    policy = normalize_policy(
+        {
+            "dayofweek": "Mo",
+            "starttime": "00:00",
+            "endtime": "04:30",
+            "parkingspaceid": "123238",
+            "postid": "102-02990",
+            "scheduletype": "FREE",
+        }
+    )
+    assert policy.start_time == time(0, 0)
