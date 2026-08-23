@@ -1,0 +1,86 @@
+"""Core V0.1 parking eligibility and ranking logic."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from math import asin, cos, radians, sin, sqrt
+
+from .models import MeterPolicy, ParkingMeter
+
+EARTH_RADIUS_M = 6_371_000.0
+
+
+@dataclass(frozen=True, slots=True)
+class ParkingCandidate:
+    meter: ParkingMeter
+    distance_m: float
+    policy: MeterPolicy | None
+
+    @property
+    def hourly_rate(self) -> float | None:
+        return self.policy.hourly_rate if self.policy else None
+
+    @property
+    def time_limit_minutes(self) -> int | None:
+        return self.policy.time_limit_minutes if self.policy else None
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    lat1, lon1, lat2, lon2 = map(radians, (lat1, lon1, lat2, lon2))
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return 2 * EARTH_RADIUS_M * asin(sqrt(a))
+
+
+def active_policy(
+    policies: list[MeterPolicy],
+    *,
+    parking_space_id: int,
+    when: datetime,
+) -> MeterPolicy | None:
+    day = when.strftime("%A").lower()
+    current = when.time()
+    matches = [
+        p for p in policies
+        if p.parking_space_id == parking_space_id
+        and p.applies_on(day)
+        and (p.start_date is None or p.start_date <= when.date())
+        and (p.end_date is None or when.date() <= p.end_date)
+        and p.start_time <= current < p.end_time
+    ]
+    if not matches:
+        return None
+    return min(matches, key=lambda p: (p.hourly_rate, p.time_limit_minutes or 10**9))
+
+
+def nearby(
+    meters: list[ParkingMeter],
+    policies: list[MeterPolicy],
+    *,
+    latitude: float,
+    longitude: float,
+    when: datetime,
+    radius_m: float = 400,
+    limit: int = 20,
+) -> list[ParkingCandidate]:
+    candidates: list[ParkingCandidate] = []
+    for meter in meters:
+        if not meter.active:
+            continue
+        distance = haversine_m(latitude, longitude, meter.latitude, meter.longitude)
+        if distance > radius_m:
+            continue
+        candidates.append(
+            ParkingCandidate(
+                meter=meter,
+                distance_m=distance,
+                policy=active_policy(policies, parking_space_id=meter.parking_space_id, when=when),
+            )
+        )
+
+    # V0.1: closest first. The ranking layer will later incorporate price,
+    # availability probability, walking distance, and restriction confidence.
+    candidates.sort(key=lambda candidate: candidate.distance_m)
+    return candidates[:limit]
