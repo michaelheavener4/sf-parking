@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -57,6 +58,33 @@ class DataSFClient:
         if not isinstance(payload, list):
             raise TypeError("DataSF returned a non-list JSON response")
         return payload
+
+    def iter_rows(
+        self,
+        dataset_id: str,
+        *,
+        select: str = "*",
+        where: str | None = None,
+        batch_size: int = 50_000,
+        order: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield a complete dataset in API-sized pages without loading it all at once."""
+        offset = 0
+        while True:
+            rows = self.query(
+                dataset_id,
+                select=select,
+                where=where,
+                limit=batch_size,
+                offset=offset,
+                order=order,
+            )
+            if not rows:
+                return
+            yield from rows
+            if len(rows) < batch_size:
+                return
+            offset += len(rows)
 
     def parking_meters(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self.query(PARKING_METERS_DATASET, **kwargs)
