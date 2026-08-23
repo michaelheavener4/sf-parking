@@ -8,7 +8,9 @@ from datetime import date, time
 
 @dataclass(frozen=True, slots=True)
 class ParkingMeter:
-    parking_space_id: int
+    """A physical parking meter/location from the SFMTA inventory."""
+
+    parking_space_id: int | None
     post_id: str | None
     latitude: float
     longitude: float
@@ -21,7 +23,10 @@ class ParkingMeter:
 
 @dataclass(frozen=True, slots=True)
 class MeterPolicy:
-    parking_space_id: int
+    """A time-bounded operating/rate policy for a parking location."""
+
+    parking_space_id: int | None
+    post_id: str | None
     day_of_week: str
     start_time: time
     end_time: time
@@ -32,4 +37,7 @@ class MeterPolicy:
     schedule_type: str | None = None
 
     def applies_on(self, day: str) -> bool:
-        return self.day_of_week.strip().lower() == day.strip().lower()
+        return self.day_of_week.strip().lower() in {
+            day.strip().lower(),
+            day.strip()[:2].lower(),
+        }
