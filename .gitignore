@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+
+# Downloaded DataSF snapshots; regenerate with scripts/ingest_datasf.py.
+data/raw/*.jsonl
+data/raw/manifest.json
