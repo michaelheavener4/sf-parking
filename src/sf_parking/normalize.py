@@ -29,7 +29,17 @@ def _date(value: Any) -> date | None:
 
 
 def _time(value: Any) -> time:
+    """Parse SFMTA schedule times, including the valid sentinel ``24:00``.
+
+    Python's ``datetime`` rejects hour 24, while SFMTA uses ``24:00`` to mean
+    the end of the service day (midnight). Represent it as the latest possible
+    time on that day so normal ``start <= current < end`` comparisons continue
+    to work without inventing a 25th hour.
+    """
     text = str(value).strip()
+    if text in {"24:00", "24:00:00"}:
+        return time.max
+
     for fmt in ("%H:%M:%S", "%H:%M", "%I:%M %p"):
         try:
             return datetime.strptime(text, fmt).time()
