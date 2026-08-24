@@ -10,7 +10,7 @@ never as a silently successful overall load.
 from __future__ import annotations
 
 import csv
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import StringIO
@@ -21,6 +21,7 @@ import pg8000.native
 from ..database import transaction
 
 BATCH_SIZE = 10_000
+ProgressCallback = Callable[[int, int, int, float], None]
 
 
 def utcnow() -> datetime:
@@ -195,15 +196,22 @@ def run_ingestion(
     *,
     retrieved_at: datetime | None = None,
     batch_size: int = BATCH_SIZE,
+    progress: ProgressCallback | None = None,
 ) -> RunResult:
     """Run one ingestion pass for ``adapter`` and record provenance.
 
     Batches commit independently so a mid-run failure keeps earlier batches
     (idempotent keys make re-runs safe), but the run itself is marked
     ``failed`` with the error attached.
+
+    ``progress(processed, stored, skipped, elapsed_seconds)`` is called after
+    every committed batch (and once at completion when a partial batch exists)
+    so CLI callers can provide live feedback without coupling the framework to
+    a particular terminal UI.
     """
     options = dict(options or {})
     retrieved_at = retrieved_at or utcnow()
+    started_monotonic = __import__("time").monotonic()
     run_id = _start_run(conn, adapter.name)
 
     processed = stored = skipped = 0
@@ -226,8 +234,12 @@ def run_ingestion(
             if len(batch) >= batch_size:
                 stored += _ingest_batch(conn, adapter, batch, run_id, retrieved_at)
                 batch.clear()
+                if progress is not None:
+                    progress(processed, stored, skipped, __import__("time").monotonic() - started_monotonic)
         if batch:
             stored += _ingest_batch(conn, adapter, batch, run_id, retrieved_at)
+            if progress is not None:
+                progress(processed, stored, skipped, __import__("time").monotonic() - started_monotonic)
     except Exception as exc:  # noqa: BLE001 - any failure marks the run failed
         status = "failed"
         error = f"{type(exc).__name__}: {exc}"
