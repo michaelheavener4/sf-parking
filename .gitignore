@@ -3,6 +3,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.py[cod]
+*.egg-info/
 
 # Downloaded DataSF snapshots; regenerate with scripts/ingest_datasf.py.
 data/raw/*.jsonl

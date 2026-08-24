@@ -1,0 +1,23 @@
+services:
+  db:
+    build:
+      context: .
+      dockerfile: db/Dockerfile
+    image: sf-parking/postgres-postgis:17
+    container_name: sf-parking-db
+    environment:
+      POSTGRES_DB: sf_parking
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - sf_parking_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sf_parking"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  sf_parking_pgdata:

@@ -40,6 +40,32 @@ DataSF / SFMTA
  map / web client
 ```
 
+## Setup
+
+Requires Docker and Python 3.11+.
+
+```bash
+# 1. Start PostgreSQL + PostGIS on localhost:5432 (database: sf_parking)
+docker compose up -d
+
+# 2. Download + normalize current SFMTA data into data/raw/
+python3 scripts/ingest_datasf.py
+
+# 3. Create schema and load data/raw/*.jsonl into PostGIS
+python3 scripts/load_database.py
+
+# 4. Run the test suite
+python3 -m pytest
+```
+
+Loading is idempotent: re-running `scripts/load_database.py` never duplicates
+records. The connection string defaults to
+`postgresql://postgres:postgres@localhost:5432/sf_parking` and can be
+overridden with the `DATABASE_URL` environment variable.
+
 ## Status
 
-🚧 Initial repository scaffold.
+🚧 V0.1: SFMTA inventory + meter policies ingested and loaded into PostGIS.
+Nearby-meter geographic queries available via
+`sf_parking.database.find_meters_near(latitude, longitude, radius_meters)`.
+Live availability is not yet implemented.
