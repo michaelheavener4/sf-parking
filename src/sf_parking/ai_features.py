@@ -50,7 +50,6 @@ def build_forecast_features(
     for post_id, rows in by_post.items():
         history: deque[tuple[datetime, float]] = deque()
         for s in rows:
-            # Keep strictly earlier states only.
             while history and (s.timestamp - history[0][0]) > timedelta(hours=24):
                 history.popleft()
             vals = [v for _, v in history]
@@ -77,25 +76,58 @@ def build_forecast_features(
     return result
 
 
+def _visible_history(
+    transactions: list[PaidTransaction],
+    slot: datetime,
+) -> list[PaidTransaction]:
+    """Return only transaction state that was knowable at ``slot``.
+
+    Sessions that started before the cutoff but ended afterward are truncated
+    at the cutoff because their eventual departure time was not yet known.
+    """
+    visible: list[PaidTransaction] = []
+    for tx in transactions:
+        if tx.start >= slot:
+            continue
+        end = min(tx.end, slot)
+        if end <= tx.start:
+            continue
+        visible.append(
+            PaidTransaction(
+                post_id=tx.post_id,
+                start=tx.start,
+                end=end,
+                meter_type=tx.meter_type,
+                payment_type=tx.payment_type,
+                duration_minutes=tx.duration_minutes,
+                gross_paid_amt=tx.gross_paid_amt,
+            )
+        )
+    return visible
+
+
 def transaction_snapshots(
     transactions: Iterable[PaidTransaction],
     *,
     slots: Iterable[datetime],
     estimator: PaidOccupancyEstimator | None = None,
 ) -> list[Snapshot]:
-    """Convert point-in-time transaction history into hourly state snapshots.
+    """Convert transaction history into hourly state snapshots.
 
-    Callers are responsible for passing only transaction data known before
-    each requested slot. This function is intentionally stateless and does not
-    fetch future rows implicitly.
+    Every snapshot is point-in-time safe: future transaction starts are ignored
+    and future transaction ends are truncated to the snapshot time.
     """
     estimator = estimator or PaidOccupancyEstimator()
     txs = list(transactions)
-    posts = sorted({t.post_id for t in txs})
+    by_post: dict[str, list[PaidTransaction]] = defaultdict(list)
+    for tx in txs:
+        by_post[tx.post_id].append(tx)
+    posts = sorted(by_post)
+
     output: list[Snapshot] = []
     for slot in sorted(slots):
         for post in posts:
-            history = [t for t in txs if t.post_id == post and t.start < slot]
+            history = _visible_history(by_post[post], slot)
             estimate: OccupancyEstimate = estimator.estimate(history, slot)
             output.append(
                 Snapshot(
