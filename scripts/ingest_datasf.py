@@ -61,6 +61,11 @@ def main() -> None:
                 "street_number": meter.street_number,
                 "blockface_id": meter.blockface_id,
                 "meter_type": meter.meter_type,
+                "street_id": meter.street_id,
+                "street_centerline_id": meter.street_centerline_id,
+                "data_as_of": (
+                    meter.data_as_of.isoformat() if meter.data_as_of else None
+                ),
             } for meter in meters),
         )
 

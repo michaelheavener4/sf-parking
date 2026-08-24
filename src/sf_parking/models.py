@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, time
+from datetime import date, datetime, time
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +19,9 @@ class ParkingMeter:
     street_number: str | None = None
     blockface_id: str | None = None
     meter_type: str | None = None
+    street_id: str | None = None
+    street_centerline_id: str | None = None
+    data_as_of: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,8 +4,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .models import MeterPolicy, ParkingMeter
+
+#: SFMTA floating timestamps (e.g. the inventory's ``data_as_of``) are local
+#: wall-clock times in the agency's operating zone. See docs/ROADMAP.md.
+SFMTA_TZ = ZoneInfo("America/Los_Angeles")
 
 
 def _float(row: dict[str, Any], *names: str) -> float:
@@ -26,6 +31,21 @@ def _date(value: Any) -> date | None:
     if not value:
         return None
     return datetime.fromisoformat(str(value).replace("Z", "+00:00")).date()
+
+
+def _sfmta_timestamp(value: Any) -> datetime | None:
+    """Parse an SFMTA floating timestamp into an aware instant.
+
+    Floating timestamps carry no offset and represent America/Los_Angeles
+    wall-clock time (see docs/ROADMAP.md); the source zone is attached so
+    ``timestamptz`` storage preserves the true absolute instant.
+    """
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=SFMTA_TZ)
+    return parsed.astimezone(SFMTA_TZ)
 
 
 def _time(value: Any) -> time:
@@ -67,6 +87,9 @@ def normalize_meter(row: dict[str, Any]) -> ParkingMeter:
         street_number=row.get("street_num"),
         blockface_id=row.get("blockface_id"),
         meter_type=row.get("meter_type"),
+        street_id=row.get("street_id"),
+        street_centerline_id=row.get("street_seg_ctrln_id"),
+        data_as_of=_sfmta_timestamp(row.get("data_as_of")),
     )
 
 

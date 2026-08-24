@@ -100,6 +100,9 @@ METER_COLUMNS = [
     "street_number",
     "blockface_id",
     "meter_type",
+    "street_id",
+    "street_centerline_id",
+    "data_as_of",
 ]
 
 POLICY_COLUMNS = [
@@ -119,7 +122,8 @@ _METER_STAGE_DDL = (
     "CREATE TEMP TABLE stage_parking_meters ("
     "post_id text, parking_space_id bigint, latitude double precision, "
     "longitude double precision, active boolean, street_name text, "
-    "street_number text, blockface_id text, meter_type text)"
+    "street_number text, blockface_id text, meter_type text, "
+    "street_id text, street_centerline_id text, data_as_of timestamptz)"
 )
 
 _POLICY_STAGE_DDL = (

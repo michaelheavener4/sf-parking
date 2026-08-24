@@ -33,6 +33,10 @@ DataSF / SFMTA
       ↓
  PostgreSQL + PostGIS
       ↓
+ canonical spatial/temporal model
+ (streets → blockfaces → curb segments → parking spaces → meters;
+ see docs/CANONICAL_MODEL.md)
+      ↓
  parking rules engine
       ↓
  nearby parking API

@@ -78,7 +78,26 @@ Implications for inference work: sessions can be joined to locations through
 new meters rather than data corruption, and all temporal features must be
 computed in America/Los_Angeles time.
 
-## V0.3 — More sources (planned)
+## V0.3 — Canonical spatial/temporal model (current)
+
+Foundation for treating sf-parking as a general SF urban data platform:
+
+- [x] Canonical hierarchy: `streets → blockfaces → curb_segments →
+      parking_spaces → meters` with PostGIS geometry where sources provide
+      it and NULLs where they do not (see docs/CANONICAL_MODEL.md).
+- [x] Temporal relationships: `meter_placements` and `parking_space_meters`
+      carry validity ranges + exclusion constraints; inventory snapshots
+      close superseded placements instead of overwriting history.
+- [x] Projections run through the generic ingestion framework as derived
+      sources (`canonical_projection:*`) — provenance, idempotency and
+      health reporting identical to external adapters
+      (`scripts/project_canonical.py`).
+- [x] Unresolved identity is modelled honestly:
+      `v_unresolved_transaction_posts`.
+- [ ] Curb-segment geometry source; space-level coordinates (no dataset yet).
+- [ ] Migrate legacy JSONL snapshot loads onto the framework.
+
+## V0.4 — More sources (planned)
 
 Adapters to add without touching core loading code:
 
@@ -90,12 +109,12 @@ Adapters to add without touching core loading code:
 
 Migrate meters/policies JSONL snapshot loads onto the framework.
 
-## V0.4 — API + UI
+## V0.5 — API + UI
 
 Nearby-parking API combining inventory, live policy state and observed
 demand; map/web client.
 
-## V0.5 — Prediction (ML)
+## V0.6 — Prediction (ML)
 
 Occupancy/demand estimation from accumulated transaction history.
 Explicitly **not** before real observation data exists — no synthetic data.
