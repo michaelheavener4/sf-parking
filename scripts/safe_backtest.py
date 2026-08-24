@@ -1,22 +1,27 @@
-"""Run the parking backtest with an automatically clamped observation frontier.
+"""Run a narrated, leakage-safe parking backtest with clipboard output.
 
-Usage:
-    python scripts/safe_backtest.py --model hour_conditioned_v1 --eval-days 7
-    python scripts/safe_backtest.py --model deterministic_v0 --until 2026-08-24T07:00:00Z
-
-The requested cutoff is clamped to the latest time for which the complete
-outcome horizon is observable in the local database. This prevents accidental
-right-edge evaluation when the CLI is run without an explicit --until.
+The command explains each major operation in plain English, keeps a visible
+heartbeat while the model works, and copies the complete final transcript to
+macOS' clipboard so it can be pasted directly into ChatGPT.
 """
 
 from __future__ import annotations
 
 import argparse
+import io
+import subprocess
+import sys
+import threading
+import time
+from contextlib import redirect_stdout
 from datetime import UTC, datetime
 
 from sf_parking.backtest import MODELS, run_backtest
 from sf_parking.database import connect
 from sf_parking.research_frontier import observation_frontier
+
+
+HEARTBEAT_FRAMES = ("🐌", "🐢", "🦥", "🐌", "🚗", "🚕", "🚌", "🚙")
 
 
 def _parse_until(value: str) -> datetime:
@@ -65,6 +70,27 @@ def _print_report(report) -> None:
             )
 
 
+def _heartbeat(stop: threading.Event, started: float, message: str) -> None:
+    i = 0
+    while not stop.wait(5.0):
+        elapsed = int(time.monotonic() - started)
+        mins, secs = divmod(elapsed, 60)
+        frame = HEARTBEAT_FRAMES[i % len(HEARTBEAT_FRAMES)]
+        print(
+            f"\n{frame} Still working after {mins:02d}:{secs:02d}. {message}",
+            flush=True,
+        )
+        i += 1
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    try:
+        subprocess.run(["pbcopy"], input=text, text=True, check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--until", type=_parse_until, default=None)
@@ -78,42 +104,98 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--include-observations", action="store_true")
     args = parser.parse_args(argv)
 
-    conn = connect()
-    try:
-        frontier = observation_frontier(conn, horizon_minutes=60)
-        if frontier is None:
-            print("No observable transaction frontier exists; refusing to run.")
-            return 2
+    transcript = io.StringIO()
+    started = time.monotonic()
 
-        requested = args.until or datetime.now(UTC)
-        effective = frontier.clamp(requested)
-        if effective is None:
-            print("No safe evaluation cutoff exists; refusing to run.")
-            return 2
+    with redirect_stdout(transcript):
+        print("🌉 SF PARKING — NARRATED SAFE BACKTEST")
+        print("═" * 72)
+        print(f"[1/5] Connecting to PostgreSQL so we can inspect the local parking history.")
+        conn = connect()
+        print("      ✅ Database connection established.")
 
-        print(f"requested_until={requested.isoformat()}")
-        print(f"max_session_end={frontier.max_session_end.isoformat()}")
-        print(f"horizon={frontier.horizon}")
-        print(f"effective_until={effective.isoformat()}")
-        if effective != requested:
-            print("WARNING: requested cutoff exceeded observable data; clamped safely.")
+        try:
+            print("[2/5] Finding the observation frontier.")
+            print("      I am checking the latest observed session end time because we must not score a forecast whose full outcome is still unseen.")
+            frontier = observation_frontier(conn, horizon_minutes=60)
+            if frontier is None:
+                print("      ❌ There is no usable transaction frontier. Refusing to run.")
+                return 2
 
-        report = run_backtest(
-            conn,
-            until=effective,
-            eval_days=args.eval_days,
-            history_window_days=args.window_days,
-            hours=tuple(args.hours) if args.hours else None,
-            post_ids=args.post_ids,
-            max_meters=args.max_meters,
-            include_observations=args.include_observations,
-            min_samples=args.min_samples,
-            model=MODELS[args.model],
-        )
-        _print_report(report)
-    finally:
-        conn.close()
+            requested = args.until or datetime.now(UTC)
+            effective = frontier.clamp(requested)
+            if effective is None:
+                print("      ❌ No safe evaluation cutoff exists. Refusing to run.")
+                return 2
 
+            print(f"      Latest observed session end: {frontier.max_session_end.isoformat()}")
+            print(f"      Forecast horizon: {frontier.horizon}")
+            print(f"      Requested cutoff: {requested.isoformat()}")
+            print(f"      Safe cutoff: {effective.isoformat()}")
+            if effective != requested:
+                print("      ⚠️ Requested cutoff was beyond the observable data, so it was clamped backward.")
+            else:
+                print("      ✅ Requested cutoff is already inside the observable data frontier.")
+
+            print("[3/5] Preparing the experiment configuration.")
+            print(f"      Model: {args.model}")
+            print(f"      Evaluation window: {args.eval_days} days")
+            print(f"      Historical lookback: {args.window_days} days")
+            if args.hours:
+                print(f"      Restricting to local hours: {sorted(args.hours)}")
+            else:
+                print("      Evaluating all local clock hours.")
+            if args.max_meters:
+                print(f"      Restricting to first {args.max_meters:,} meters for this run.")
+            else:
+                print("      Evaluating every meter with usable transaction history.")
+
+            print("[4/5] Running the backtest.")
+            print("      The model is now reconstructing what was knowable at each prediction time, generating predictions, and comparing them with the observed paid-session proxy.")
+            print("      ⏳ A heartbeat will appear every 5 seconds so a long run is visibly alive.")
+            stop = threading.Event()
+            heartbeat = threading.Thread(
+                target=_heartbeat,
+                args=(
+                    stop,
+                    started,
+                    "PostgreSQL and the model are still processing the historical evaluation window; no new terminal input is required.",
+                ),
+                daemon=True,
+            )
+            heartbeat.start()
+            try:
+                report = run_backtest(
+                    conn,
+                    until=effective,
+                    eval_days=args.eval_days,
+                    history_window_days=args.window_days,
+                    hours=tuple(args.hours) if args.hours else None,
+                    post_ids=args.post_ids,
+                    max_meters=args.max_meters,
+                    include_observations=args.include_observations,
+                    min_samples=args.min_samples,
+                    model=MODELS[args.model],
+                )
+            finally:
+                stop.set()
+                heartbeat.join(timeout=1.0)
+
+            print("      ✅ Backtest computation finished.")
+            print("[5/5] Summarizing the experiment.")
+            _print_report(report)
+            elapsed = int(time.monotonic() - started)
+            mins, secs = divmod(elapsed, 60)
+            print("═" * 72)
+            print(f"✅ COMPLETE — total elapsed time {mins:02d}:{secs:02d}")
+            print("📋 The complete transcript will be copied to the macOS clipboard now.")
+        finally:
+            conn.close()
+
+    final_text = transcript.getvalue()
+    copied = _copy_to_clipboard(final_text)
+    print(final_text, end="")
+    print("📋 Clipboard: copied successfully." if copied else "⚠️ Clipboard copy failed; pbcopy is unavailable.")
     return 0
 
 
