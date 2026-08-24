@@ -15,8 +15,10 @@ WITH raw AS (
               GREATEST(r.clipped_start, gs))) / 60.0) AS overlap_minutes
     FROM raw r
     CROSS JOIN LATERAL generate_series(
-        date_trunc('hour', r.clipped_start),
-        date_trunc('hour', r.clipped_end - INTERVAL '1 microsecond'),
+        (date_trunc('hour', r.clipped_start AT TIME ZONE 'America/Los_Angeles')
+            AT TIME ZONE 'America/Los_Angeles'),
+        (date_trunc('hour', (r.clipped_end - INTERVAL '1 microsecond') AT TIME ZONE 'America/Los_Angeles')
+            AT TIME ZONE 'America/Los_Angeles'),
         INTERVAL '1 hour'
     ) gs
 ), scored AS (
