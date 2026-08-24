@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Iterable
 
-from .occupancy import OccupancyEstimate, PaidOccupancyEstimator, PaidTransaction
+from .occupancy import DurationProfile, OccupancyEstimate, PaidOccupancyEstimator, PaidTransaction
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,31 +25,36 @@ def make_next_slot_targets(
     forecast_times: Iterable[datetime],
     horizon_minutes: int = 60,
     estimator: PaidOccupancyEstimator | None = None,
+    profile: DurationProfile | None = None,
 ) -> tuple[StateTarget, ...]:
-    """Create targets using the *future* observation window only.
+    """Create labels from a future outcome interval only.
 
-    The caller must build training features from transactions available at the
-    corresponding forecast_time. This function derives the label from the
-    complete target interval [forecast_time+horizon, +2*horizon), which makes
-    it explicit that target information is never fed into features.
+    ``profile`` must come from training/history when supplied. If omitted, a
+    fixed conservative profile is used; the label is never allowed to derive
+    its duration scale from the future target rows themselves.
     """
     estimator = estimator or PaidOccupancyEstimator()
     txs = list(transactions)
     posts = sorted({t.post_id for t in txs})
     out: list[StateTarget] = []
     horizon = timedelta(minutes=horizon_minutes)
+    label_profile = profile or DurationProfile(60.0, 120.0)
     for forecast_time in sorted(forecast_times):
         target_start = forecast_time + horizon
         target_end = target_start + horizon
         for post_id in posts:
             future = [
-                t for t in txs
+                t
+                for t in txs
                 if t.post_id == post_id
                 and t.start < target_end
                 and t.end > target_start
             ]
             est: OccupancyEstimate = estimator.estimate(
-                future, target_start, slot_minutes=horizon_minutes
+                future,
+                target_start,
+                slot_minutes=horizon_minutes,
+                profile=label_profile,
             )
             out.append(
                 StateTarget(
