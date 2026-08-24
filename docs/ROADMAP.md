@@ -94,8 +94,13 @@ Foundation for treating sf-parking as a general SF urban data platform:
       (`scripts/project_canonical.py`).
 - [x] Unresolved identity is modelled honestly:
       `v_unresolved_transaction_posts`.
+- [x] Parking-state feature layer: deterministic per-meter features and a
+      documented baseline availability score (`sf_parking.features`,
+      docs/PARKING_STATE.md). Explicitly not calibrated as a probability.
 - [ ] Curb-segment geometry source; space-level coordinates (no dataset yet).
 - [ ] Migrate legacy JSONL snapshot loads onto the framework.
+- [ ] Policy-aware availability (blocked: DataSF emptied qq7v-hds4 on
+      2026-08-24; awaiting republish or replacement dataset).
 
 ## V0.4 — More sources (planned)
 

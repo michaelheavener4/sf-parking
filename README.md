@@ -72,4 +72,5 @@ overridden with the `DATABASE_URL` environment variable.
 🚧 V0.1: SFMTA inventory + meter policies ingested and loaded into PostGIS.
 Nearby-meter geographic queries available via
 `sf_parking.database.find_meters_near(latitude, longitude, radius_meters)`.
-Live availability is not yet implemented.
+A deterministic baseline availability score (not yet calibrated) is
+available via `sf_parking.features` — see docs/PARKING_STATE.md.
