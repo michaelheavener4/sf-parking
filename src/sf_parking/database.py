@@ -10,6 +10,7 @@ import csv
 import json
 import os
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
@@ -41,8 +42,29 @@ def connect(url: str | None = None) -> pg8000.native.Connection:
     )
 
 
+@contextmanager
+def transaction(conn: pg8000.native.Connection) -> Iterator[pg8000.native.Connection]:
+    """Explicit transaction: COMMIT on success, ROLLBACK on any failure.
+
+    pg8000.native runs with autocommit off, so every statement joins the
+    open transaction; without an explicit COMMIT nothing is ever persisted
+    to other connections.
+    """
+    conn.run("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        # Best-effort rollback; never mask the original failure.
+        with suppress(pg8000.Error, OSError):
+            conn.run("ROLLBACK")
+        raise
+    else:
+        conn.run("COMMIT")
+
+
 def apply_schema(conn: pg8000.native.Connection, schema_path: Path) -> None:
-    conn.run(schema_path.read_text(encoding="utf-8"))
+    with transaction(conn):
+        conn.run(schema_path.read_text(encoding="utf-8"))
 
 
 def _rows(path: Path) -> Iterator[dict[str, Any]]:
@@ -113,27 +135,31 @@ def load_parking_meters(
     path: Path,
     batch_size: int = METERS_BATCH_SIZE,
 ) -> int:
-    """Load meters from JSONL via staged COPY. Idempotent on ``post_id``."""
+    """Load meters from JSONL via staged COPY. Idempotent on ``post_id``.
+
+    Runs in a single explicit transaction that COMMITs on success and
+    ROLLBACKs on failure; the returned count only becomes visible to other
+    connections once the commit has succeeded.
+    """
     del batch_size
-    conn.run("DROP TABLE IF EXISTS stage_parking_meters")
-    conn.run(_METER_STAGE_DDL)
-    conn.run(
-        f"COPY stage_parking_meters ({', '.join(METER_COLUMNS)}) "
-        "FROM STDIN WITH (FORMAT csv)",
-        stream=_csv_stream(_rows(path), METER_COLUMNS),
-    )
-    updates = ", ".join(f"{col} = EXCLUDED.{col}" for col in METER_COLUMNS[1:])
-    result = conn.run(
-        f"WITH ins AS ("
-        f"INSERT INTO parking_meters ({', '.join(METER_COLUMNS)}) "
-        f"SELECT {', '.join(METER_COLUMNS)} FROM stage_parking_meters "
-        f"ON CONFLICT (post_id) DO UPDATE SET {updates} "
-        f"RETURNING 1) "
-        f"SELECT count(*) FROM ins"
-    )
-    processed = int(result[0][0])
-    conn.run("DROP TABLE stage_parking_meters")
-    conn.run("commit")
+    with transaction(conn):
+        conn.run("DROP TABLE IF EXISTS stage_parking_meters")
+        conn.run(_METER_STAGE_DDL)
+        conn.run(
+            f"COPY stage_parking_meters ({', '.join(METER_COLUMNS)}) "
+            "FROM STDIN WITH (FORMAT csv)",
+            stream=_csv_stream(_rows(path), METER_COLUMNS),
+        )
+        updates = ", ".join(f"{col} = EXCLUDED.{col}" for col in METER_COLUMNS[1:])
+        result = conn.run(
+            f"WITH ins AS ("
+            f"INSERT INTO parking_meters ({', '.join(METER_COLUMNS)}) "
+            f"SELECT {', '.join(METER_COLUMNS)} FROM stage_parking_meters "
+            f"ON CONFLICT (post_id) DO UPDATE SET {updates} "
+            f"RETURNING 1) "
+            f"SELECT count(*) FROM ins"
+        )
+        processed = int(result[0][0])
     return processed
 
 
@@ -142,26 +168,30 @@ def load_meter_policies(
     path: Path,
     batch_size: int = POLICIES_BATCH_SIZE,
 ) -> int:
-    """Load policies from JSONL via staged COPY. Idempotent on the full policy tuple."""
+    """Load policies from JSONL via staged COPY. Idempotent on the full policy tuple.
+
+    Runs in a single explicit transaction that COMMITs on success and
+    ROLLBACKs on failure; the returned count only becomes visible to other
+    connections once the commit has succeeded.
+    """
     del batch_size
-    conn.run("DROP TABLE IF EXISTS stage_meter_policies")
-    conn.run(_POLICY_STAGE_DDL)
-    conn.run(
-        f"COPY stage_meter_policies ({', '.join(POLICY_COLUMNS)}) "
-        "FROM STDIN WITH (FORMAT csv)",
-        stream=_csv_stream(_rows(path), POLICY_COLUMNS),
-    )
-    result = conn.run(
-        f"WITH ins AS ("
-        f"INSERT INTO meter_policies ({', '.join(POLICY_COLUMNS)}) "
-        f"SELECT {', '.join(POLICY_COLUMNS)} FROM stage_meter_policies "
-        f"ON CONFLICT DO NOTHING "
-        f"RETURNING 1) "
-        f"SELECT count(*) FROM ins"
-    )
-    inserted = int(result[0][0])
-    conn.run("DROP TABLE stage_meter_policies")
-    conn.run("commit")
+    with transaction(conn):
+        conn.run("DROP TABLE IF EXISTS stage_meter_policies")
+        conn.run(_POLICY_STAGE_DDL)
+        conn.run(
+            f"COPY stage_meter_policies ({', '.join(POLICY_COLUMNS)}) "
+            "FROM STDIN WITH (FORMAT csv)",
+            stream=_csv_stream(_rows(path), POLICY_COLUMNS),
+        )
+        result = conn.run(
+            f"WITH ins AS ("
+            f"INSERT INTO meter_policies ({', '.join(POLICY_COLUMNS)}) "
+            f"SELECT {', '.join(POLICY_COLUMNS)} FROM stage_meter_policies "
+            f"ON CONFLICT DO NOTHING "
+            f"RETURNING 1) "
+            f"SELECT count(*) FROM ins"
+        )
+        inserted = int(result[0][0])
     return inserted
 
 
@@ -233,16 +263,24 @@ def main() -> None:
         apply_schema(conn, args.schema)
         meter_count = load_parking_meters(conn, args.data_dir / "parking_meters.jsonl")
         policy_count = load_meter_policies(conn, args.data_dir / "meter_policies.jsonl")
-        meters_total = conn.run("SELECT count(*) FROM parking_meters")[0][0]
-        policies_total = conn.run("SELECT count(*) FROM meter_policies")[0][0]
     finally:
         conn.close()
+
+    # Verify persistence from an independent connection: rows are only
+    # reported as stored if they are visible outside the loading session.
+    verify = connect(args.database_url)
+    try:
+        meters_total = int(verify.run("SELECT count(*) FROM parking_meters")[0][0])
+        policies_total = int(verify.run("SELECT count(*) FROM meter_policies")[0][0])
+    finally:
+        verify.close()
 
     print(
         json.dumps(
             {
                 "processed": {"parking_meters": meter_count, "meter_policies": policy_count},
                 "stored": {"parking_meters": meters_total, "meter_policies": policies_total},
+                "verified_from_independent_connection": True,
             },
             indent=2,
         )

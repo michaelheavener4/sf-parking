@@ -62,6 +62,7 @@ def db():
 def clean_tables(db):
     yield
     db.run("TRUNCATE parking_meters, meter_policies")
+    db.run("COMMIT")  # make the cleanup visible to other connections
 
 
 def _write_jsonl(path: Path, rows) -> None:
@@ -225,6 +226,131 @@ class TestIdempotentLoading:
         assert stored[3] == "00:00:00"
         assert float(stored[4]) == 0.0
         assert stored[5] == "FREE"
+
+
+class TestTransactionPersistence:
+    """Regression tests: loads must COMMIT and survive independent connections."""
+
+    def test_loaded_data_visible_from_second_connection(self, db, tmp_path):
+        meters_path = tmp_path / "parking_meters.jsonl"
+        _write_jsonl(
+            meters_path,
+            [
+                {
+                    "post_id": "100-00001",
+                    "parking_space_id": None,
+                    "latitude": 37.7880,
+                    "longitude": -122.4075,
+                    "active": True,
+                    "street_name": "MARKET ST",
+                    "street_number": "1",
+                    "blockface_id": "100001",
+                    "meter_type": "SS",
+                },
+                {
+                    "post_id": "100-00002",
+                    "parking_space_id": 42,
+                    "latitude": 37.7892,
+                    "longitude": -122.4075,
+                    "active": False,
+                    "street_name": "MARKET ST",
+                    "street_number": "2",
+                    "blockface_id": "100001",
+                    "meter_type": "SS",
+                },
+            ],
+        )
+        policies_path = tmp_path / "meter_policies.jsonl"
+        _write_jsonl(
+            policies_path,
+            [
+                {
+                    "parking_space_id": 42,
+                    "post_id": "100-00002",
+                    "day_of_week": "Mo",
+                    "start_time": "09:00:00",
+                    "end_time": "18:00:00",
+                    "hourly_rate": 4.5,
+                    "time_limit_minutes": 120,
+                    "start_date": "2026-07-13",
+                    "end_date": "2200-12-31",
+                    "schedule_type": "MTR",
+                }
+            ],
+        )
+
+        load_parking_meters(db, meters_path)
+        load_meter_policies(db, policies_path)
+
+        # Independent connection: must see the committed rows even though
+        # the loading connection may still hold open transactions.
+        other = connect()
+        try:
+            assert other.run("SELECT count(*) FROM parking_meters")[0][0] == 2
+            row = other.run(
+                "SELECT post_id, parking_space_id FROM parking_meters "
+                "WHERE post_id = '100-00002'"
+            )[0]
+            assert row == ["100-00002", 42]
+            assert other.run("SELECT count(*) FROM meter_policies")[0][0] == 1
+        finally:
+            other.close()
+
+    def test_failed_load_rolls_back_and_keeps_previous_state(self, db, tmp_path):
+        good_path = tmp_path / "good.jsonl"
+        _write_jsonl(
+            good_path,
+            [
+                {
+                    "post_id": "200-00001",
+                    "parking_space_id": None,
+                    "latitude": 37.7880,
+                    "longitude": -122.4075,
+                    "active": True,
+                    "street_name": "POLK ST",
+                    "street_number": "1",
+                    "blockface_id": "612131",
+                    "meter_type": "SS",
+                }
+            ],
+        )
+        load_parking_meters(db, good_path)
+
+        bad_path = tmp_path / "bad.jsonl"
+        _write_jsonl(
+            bad_path,
+            [
+                {
+                    "post_id": "200-00002",
+                    "parking_space_id": "not-a-number",  # COPY will reject this
+                    "latitude": 37.7880,
+                    "longitude": -122.4075,
+                    "active": True,
+                    "street_name": "POLK ST",
+                    "street_number": "2",
+                    "blockface_id": "612131",
+                    "meter_type": "SS",
+                }
+            ],
+        )
+
+        with pytest.raises(pg8000.Error):
+            load_parking_meters(db, bad_path)
+
+        # Rolled back: nothing from the failed batch persisted...
+        other = connect()
+        try:
+            posts = {
+                row[0]
+                for row in other.run("SELECT post_id FROM parking_meters")
+            }
+            assert posts == {"200-00001"}
+        finally:
+            other.close()
+
+        # ...and the connection is still usable after the rollback.
+        load_parking_meters(db, good_path)
+        assert db.run("SELECT count(*) FROM parking_meters")[0][0] == 1
 
 
 class TestNearbyQuery:
