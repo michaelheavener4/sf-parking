@@ -8,8 +8,8 @@ ships a dependency-free deterministic logistic model for tests/smoke runs.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from math import exp, log
+from datetime import datetime
+from math import exp, isnan
 from typing import Iterable, Sequence
 
 
@@ -69,6 +69,10 @@ def mae(y_true: Iterable[float], y_pred: Iterable[float]) -> float:
     return sum(abs(p - y) for y, p in zip(ys, ps)) / len(ys)
 
 
+def _clean_feature(x: float) -> float:
+    return 0.0 if isnan(x) else x
+
+
 class LogisticFallback:
     """Small dependency-free logistic regression for smoke tests and fallback use."""
 
@@ -100,32 +104,36 @@ class LogisticFallback:
             grad_w = [0.0] * width
             grad_b = 0.0
             for row in rows:
-                z = self.bias + sum(w * x for w, x in zip(self.weights, row.features))
+                z = self.bias + sum(
+                    w * _clean_feature(x)
+                    for w, x in zip(self.weights, row.features)
+                )
                 p = self._sigmoid(z)
                 err = p - row.target
                 grad_b += err
                 for i, x in enumerate(row.features):
-                    grad_w[i] += err * x
+                    grad_w[i] += err * _clean_feature(x)
             self.bias -= self.learning_rate * grad_b / n
             for i in range(width):
-                self.weights[i] -= self.learning_rate * ((grad_w[i] / n) + self.l2 * self.weights[i])
+                self.weights[i] -= self.learning_rate * (
+                    (grad_w[i] / n) + self.l2 * self.weights[i]
+                )
         return self
 
     def predict_proba(self, rows: Sequence[ForecastRow]) -> list[float]:
         if not self.weights:
             raise RuntimeError("model is not fitted")
         return [
-            self._sigmoid(self.bias + sum(w * x for w, x in zip(self.weights, row.features)))
+            self._sigmoid(
+                self.bias
+                + sum(w * _clean_feature(x) for w, x in zip(self.weights, row.features))
+            )
             for row in rows
         ]
 
 
 class LightGBMForecastModel:
-    """Optional high-performance tree forecaster.
-
-    LightGBM is deliberately optional: the core repository remains lightweight,
-    while `requirements-ml.txt` provides the production training dependency.
-    """
+    """Optional high-performance tree forecaster."""
 
     def __init__(self, **params: object) -> None:
         self.params = {
@@ -160,4 +168,7 @@ class LightGBMForecastModel:
     def predict_proba(self, rows: Sequence[ForecastRow]) -> list[float]:
         if self._model is None:
             raise RuntimeError("model is not fitted")
-        return [float(min(1.0, max(0.0, p))) for p in self._model.predict([list(r.features) for r in rows])]
+        return [
+            float(min(1.0, max(0.0, p)))
+            for p in self._model.predict([list(r.features) for r in rows])
+        ]
