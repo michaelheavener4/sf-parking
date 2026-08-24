@@ -44,6 +44,23 @@ def ensure_table(conn) -> None:
     conn.run("COMMIT")
 
 
+def ensure_post_spans(conn) -> None:
+    """Create one reusable historical observation span per transaction meter."""
+    conn.run("DROP TABLE IF EXISTS _state_post_spans")
+    conn.run("""
+    CREATE TEMP TABLE _state_post_spans AS
+    SELECT
+        post_id,
+        MIN((session_start AT TIME ZONE 'America/Los_Angeles')::date) AS first_local_date,
+        MAX((COALESCE(session_end, session_start) AT TIME ZONE 'America/Los_Angeles')::date) AS last_local_date
+    FROM meter_transactions
+    WHERE session_end IS NOT NULL
+    GROUP BY post_id
+    """)
+    conn.run("CREATE INDEX _state_post_spans_dates ON _state_post_spans(first_local_date, last_local_date)")
+    conn.run("COMMIT")
+
+
 def write_day(conn, day: date, query: str) -> int:
     start, end = utc_bounds(day)
     rows = conn.run(query, day_start=start, day_end=end, max_prob=MAX_PROB, p90_minutes=P90_MINUTES)
@@ -56,9 +73,6 @@ def write_day(conn, day: date, query: str) -> int:
     writer = csv.writer(buffer, lineterminator="\n")
     for row in rows:
         post_id, slot, local_date, local_hour, meter_type, tx_count, minutes, prob = row
-        # pg8000 may decode numeric expressions as Decimal. Convert at the
-        # database/application boundary so COPY receives plain floats and the
-        # availability complement is numerically well-defined.
         prob = float(prob)
         writer.writerow([
             post_id,
@@ -95,13 +109,18 @@ def main() -> int:
         raise SystemExit("--end must be >= --start")
 
     print("🌉 SF PARKING — HOURLY PAID-STATE MATERIALIZER")
-    print("[1/3] Creating the derived hourly state table.")
+    print("[1/4] Opening PostgreSQL and creating the derived hourly state table.")
     conn = connect()
     try:
         ensure_table(conn)
-        query = QUERY.read_text(encoding="utf-8")
         print("      ✅ Table ready.")
-        print("[2/3] Rebuilding one local day at a time.")
+        print("[2/4] Finding each meter's historical observation span.")
+        print("      I need this so a zero-transaction hour becomes an explicit 0 probability only while the meter is historically observed.")
+        ensure_post_spans(conn)
+        span_count = conn.run("SELECT count(*) FROM _state_post_spans")[0][0]
+        print(f"      ✅ Historical spans ready for {span_count:,} meters.")
+        query = QUERY.read_text(encoding="utf-8")
+        print("[3/4] Rebuilding one local day at a time.")
         total = 0
         days = (end - start).days + 1
         day = start
@@ -110,12 +129,13 @@ def main() -> int:
             total += rows
             print(f"      🚗 [{i + 1}/{days}] {day}: {rows:,} state rows; total={total:,}", flush=True)
             day += timedelta(days=1)
-        print("[3/3] Verifying the derived table.")
-        row = conn.run("SELECT count(*), min(slot_start), max(slot_start), min(paid_occupancy_probability), max(paid_occupancy_probability) FROM parking_state_hourly")[0]
+        print("[4/4] Verifying the derived table.")
+        row = conn.run("SELECT count(*), min(slot_start), max(slot_start), min(paid_occupancy_probability), max(paid_occupancy_probability), count(*) FILTER (WHERE transaction_count = 0) FROM parking_state_hourly")[0]
         print(f"      rows={row[0]:,}")
         print(f"      first_slot={row[1]}")
         print(f"      last_slot={row[2]}")
         print(f"      probability_range={row[3]}..{row[4]}")
+        print(f"      explicit_zero_transaction_states={row[5]:,}")
         print("✅ COMPLETE")
     finally:
         conn.close()
