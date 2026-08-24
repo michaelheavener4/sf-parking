@@ -10,10 +10,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable
 
-from .ai_features import Snapshot, build_forecast_features
+from .ai_features import Snapshot, build_forecast_features, transaction_snapshots
 from .forecast import ForecastRow
 from .occupancy import PaidOccupancyEstimator, PaidTransaction
 from .spatial import SpatialGraph
+from .targets import make_next_slot_targets
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,34 +29,40 @@ def build_pipeline_artifacts(
     slots: Iterable[datetime],
     graph: SpatialGraph | None = None,
     estimator: PaidOccupancyEstimator | None = None,
+    horizon_minutes: int = 60,
 ) -> PipelineArtifacts:
-    """Build leak-safe state/features from caller-supplied historical data.
+    """Build training rows with an explicit future target and prior-only features.
 
-    No component fetches future data. The caller controls the transaction set
-    and slot cutoffs; this is essential for reproducible research.
+    A ForecastRow timestamp is the forecast time. Its target is the estimated
+    paid-occupancy state in the *next* horizon. Feature construction sees only
+    snapshots at or before that forecast time; target construction uses the
+    future interval strictly after it.
     """
-    from .ai_features import transaction_snapshots
+    txs = tuple(transactions)
+    slots_tuple = tuple(sorted(slots))
+    estimator = estimator or PaidOccupancyEstimator()
 
-    snapshots = transaction_snapshots(
-        transactions,
-        slots=slots,
+    snapshots = transaction_snapshots(txs, slots=slots_tuple, estimator=estimator)
+    feature_map = build_forecast_features(snapshots, graph=graph)
+    targets = make_next_slot_targets(
+        txs,
+        forecast_times=slots_tuple,
+        horizon_minutes=horizon_minutes,
         estimator=estimator,
     )
-    feature_map = build_forecast_features(snapshots, graph=graph)
+    target_by_key = {(t.post_id, t.forecast_time): t for t in targets}
+
     rows: list[ForecastRow] = []
     for snapshot in snapshots:
-        if snapshot.probability_paid_occupied is None:
+        target = target_by_key.get((snapshot.post_id, snapshot.timestamp))
+        if target is None:
             continue
-        # Forecast the next snapshot's paid occupancy state. Rows whose target
-        # is not yet known are created by the caller from future snapshots; the
-        # builder itself never peeks beyond the snapshot timestamp.
-        features = feature_map[(snapshot.post_id, snapshot.timestamp)]
         rows.append(
             ForecastRow(
                 timestamp=snapshot.timestamp,
                 post_id=snapshot.post_id,
-                target=snapshot.probability_paid_occupied,
-                features=features,
+                target=target.probability_paid_occupied,
+                features=feature_map[(snapshot.post_id, snapshot.timestamp)],
             )
         )
     return PipelineArtifacts(tuple(snapshots), tuple(rows))
