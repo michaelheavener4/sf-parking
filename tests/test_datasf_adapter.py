@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
 from sf_parking.adapters import DataSFMeterTransactionsAdapter
-from sf_parking.adapters.datasf import _window_where, normalize_transaction
+from sf_parking.adapters.datasf import (
+    SOURCE_TZ,
+    _window_where,
+    normalize_transaction,
+)
 from sf_parking.ingestion.framework import IngestionRecord, InvalidRecord
 
 RAW_ROW = {
@@ -29,13 +33,15 @@ def test_normalize_real_shaped_row() -> None:
     assert record.key == ("999999996_9_11182022070000", "665-01003")
     values = record.values
     assert values["post_id"] == "665-01003"
-    assert values["session_start"] == datetime.fromisoformat("2022-11-18T07:00:00")
-    assert values["session_end"] == datetime.fromisoformat("2022-11-18T09:00:00")
+    # Floating timestamps are America/Los_Angeles wall-clock times; 07:00 PST
+    # is 15:00 UTC.
+    assert values["session_start"] == datetime(2022, 11, 18, 7, tzinfo=SOURCE_TZ)
+    assert values["session_end"] == datetime(2022, 11, 18, 9, tzinfo=SOURCE_TZ)
     assert values["duration_minutes"] == 120
     assert values["gross_paid_amt"] == 2.0
     assert values["payment_type"] == "PAY BY CELL"
     assert values["meter_event_type"] == "NS"
-    assert record.source_timestamp == datetime.fromisoformat("2022-11-18T07:00:00")
+    assert record.source_timestamp == datetime(2022, 11, 18, 7, tzinfo=SOURCE_TZ)
 
 
 def test_normalize_computes_fractional_duration() -> None:
@@ -119,5 +125,16 @@ def test_window_where_combines_filter_and_explicit_where() -> None:
         {"window_days": 1, "where": "payment_type = 'COINS'"},
         now=datetime.fromisoformat("2026-08-23T12:00:00"),
     )
-    assert "session_start_dt >= '2026-08-22T12:00:00'" in where
+    # now is UTC 2026-08-23T12:00 = 05:00 PDT on the source clock; the window
+    # boundary is expressed in source-local wall time.
+    assert "session_start_dt >= '2026-08-22T05:00:00'" in where
     assert "(payment_type = 'COINS')" in where
+
+
+def test_window_where_accepts_aware_now() -> None:
+    where = _window_where(
+        {"window_days": 7},
+        now=datetime(2026, 8, 23, 19, 0, tzinfo=UTC),
+    )
+    # 2026-08-23T19:00Z minus 7 days is 2026-08-16T19:00Z = 12:00 PDT.
+    assert "session_start_dt >= '2026-08-16T12:00:00'" in where

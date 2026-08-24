@@ -14,9 +14,17 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ..datasf import DataSFClient
 from ..ingestion.framework import IngestionRecord, InvalidRecord
+
+#: DataSF exposes ``session_start_dt``/``session_end_dt`` as Socrata *floating*
+#: timestamps: wall-clock times with no offset, reported in the operating
+#: agency's local clock. SFMTA meters operate on America/Los_Angeles time;
+#: the observed session distribution (peak 09:00-16:00 with a hard stop at
+#: 18:00) only makes sense as Pacific wall-clock time. See docs/ROADMAP.md.
+SOURCE_TZ = ZoneInfo("America/Los_Angeles")
 
 DATASET_ID = "imvp-dq3v"
 ADAPTER_NAME = "sfmta_meter_transactions"
@@ -40,10 +48,27 @@ DEFAULT_PAGE_SIZE = 50_000
 
 
 def parse_socrata_timestamp(value: Any) -> datetime | None:
-    """Parse a Socrata floating timestamp like ``2022-11-18T07:00:00.000``."""
+    """Parse a Socrata floating timestamp like ``2022-11-18T07:00:00.000``.
+
+    Floating timestamps carry no offset and represent America/Los_Angeles
+    wall-clock time, so the source zone is attached here and the value is
+    returned as an aware datetime. PostgreSQL ``timestamptz`` then stores the
+    correct absolute instant instead of misreading the wall clock as UTC.
+
+    DST edge cases follow PEP 495 / :mod:`zoneinfo` semantics:
+
+    - Ambiguous local times (fall-back, e.g. ``2025-11-02T01:30``) resolve to
+      the *first* occurrence (``fold=0``, still PDT/UTC-7).
+    - Nonexistent local times (spring-forward, e.g. ``2026-03-08T02:30``)
+      keep the wall clock with the pre-transition offset; converting to UTC
+      lands after the transition.
+    """
     if value in (None, ""):
         return None
-    return datetime.fromisoformat(str(value))
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=SOURCE_TZ)
+    return parsed.astimezone(SOURCE_TZ)
 
 
 def normalize_transaction(row: dict[str, Any]) -> IngestionRecord:
@@ -63,11 +88,15 @@ def normalize_transaction(row: dict[str, Any]) -> IngestionRecord:
         raise ValueError(f"transaction {transmission_id!r} has no session start")
 
     session_end = parse_socrata_timestamp(row.get("session_end_dt"))
-    duration_minutes = (
-        int((session_end - session_start).total_seconds() // 60)
-        if session_end is not None
-        else None
-    )
+    duration_minutes = None
+    if session_end is not None:
+        # Subtract absolute instants: Python ignores utcoffset when both
+        # operands share the same tzinfo, which would silently report wall
+        # clock elapsed time across DST transitions instead of real time.
+        seconds = (
+            session_end.astimezone(UTC) - session_start.astimezone(UTC)
+        ).total_seconds()
+        duration_minutes = int(seconds // 60)
 
     amount = row.get("gross_paid_amt")
     gross_paid_amt = float(amount) if amount not in (None, "") else None
@@ -90,14 +119,22 @@ def normalize_transaction(row: dict[str, Any]) -> IngestionRecord:
 
 
 def _window_where(options: dict[str, Any], *, now: datetime | None = None) -> str:
-    # DataSF timestamps are naive local times; compare against a naive UTC
-    # clock so window boundaries stay deterministic regardless of host TZ.
-    now = now or datetime.now(UTC).replace(tzinfo=None)
+    # DataSF floating timestamps are America/Los_Angeles wall-clock times, so
+    # the rolling window boundary must be expressed on that clock. A naive
+    # ``now`` is interpreted as UTC (never as source-local time); aware
+    # datetimes are used as-is. The boundary is converted onto the source
+    # clock and compared against a naive local string, keeping the Socrata
+    # filter deterministic regardless of host timezone.
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    local_now = now.astimezone(SOURCE_TZ).replace(tzinfo=None)
     window_days = int(options.get("window_days", DEFAULT_WINDOW_DAYS))
     where = options.get("where")
     clauses = []
     if window_days > 0:
-        since = (now - timedelta(days=window_days)).strftime("%Y-%m-%dT%H:%M:%S")
+        since = (local_now - timedelta(days=window_days)).strftime("%Y-%m-%dT%H:%M:%S")
         clauses.append(f"session_start_dt >= '{since}'")
     if where:
         clauses.append(f"({where})")

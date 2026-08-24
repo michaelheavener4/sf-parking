@@ -14,7 +14,7 @@ Given a destination, arrival time, and intended parking duration, return nearby 
 - distance from destination
 - source/evidence metadata
 
-V0.1 intentionally does **not** claim live occupancy. The SFMTA meter inventory contains physical meter/location data, while the current Meter Policies dataset supplies daily schedules and rates. These are separate datasets joined by `ParkingSpaceID`.
+V0.1 intentionally does **not** claim live occupancy. The SFMTA meter inventory contains physical meter/location data, while the current Meter Policies dataset supplies daily schedules and rates. These datasets join on `post_id` (verified against live DataSF data; see docs/ROADMAP.md).
 
 ## Data sources
 

@@ -84,6 +84,28 @@ CREATE INDEX IF NOT EXISTS idx_ingestion_runs_source_started
 -- One row per paid session/extension event at one meter. Source identifiers
 -- are preserved and every record traces to its ingestion run and retrieval
 -- time. Idempotent on (transmission_id, post_id).
+--
+-- Identifier semantics (verified against live DataSF data, Aug 2026):
+--   * post_id is the cross-dataset key documented by DataSF ("The identifier
+--     of the meter this transaction is related to. See the related meters
+--     dataset ... /d/8vzz-qzz9"). Both datasets use the identical
+--     NNN-NNNNN namespace with no formatting differences.
+--   * All 13,776 distinct post_ids in production transactions match the
+--     current inventory snapshot; 99.3% of post_ids from 2017-era
+--     transactions are still present in the 2026 inventory, so the namespace
+--     is stable across ~9 years. Unmatched rows are meters retired after the
+--     transaction occurred (or added after its window) — legitimate history.
+--   * For that reason there is deliberately NO foreign key on post_id:
+--     transaction observations must survive inventory refreshes, and a
+--     missing match is surfaced by the post_id_coverage health check rather
+--     than rejected at insert time.
+--
+-- Timestamp semantics: session_start/session_end arrive as Socrata floating
+-- timestamps — America/Los_Angeles wall-clock times with no offset. The
+-- adapter attaches the source zone before insert so these timestamptz values
+-- represent true absolute instants (DST-safe). Rows ingested before this fix
+-- were retagged in place by migration
+-- 'migration:retag_source_local_timestamps'.
 CREATE TABLE IF NOT EXISTS meter_transactions (
     transmission_id  text NOT NULL,
     post_id          text NOT NULL,
