@@ -4,13 +4,19 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
-from datetime import date
 
 import pandas as pd
 
 from sf_parking.database import connect
 
-FEATURES = ["hour_sin", "hour_cos", "weekday_sin", "weekday_cos", "current_availability", "transaction_count"]
+FEATURES = [
+    "hour_sin",
+    "hour_cos",
+    "weekday_sin",
+    "weekday_cos",
+    "current_availability",
+    "transaction_count",
+]
 
 
 def main() -> int:
@@ -30,8 +36,8 @@ def main() -> int:
         print(f"      Earliest state: {bounds[0]}")
         print(f"      Latest state:   {bounds[1]}")
 
-        print("[2/5] Building a one-hour-ahead training table.")
-        print("      Missing next-hour state is treated as zero paid occupancy probability.")
+        print("[2/5] Building a one-hour-ahead forecasting table.")
+        print("      Every target must be an actually observed next-hour state; rows at the observation frontier are excluded.")
         rows = conn.run("""
             WITH base AS (
                 SELECT
@@ -41,9 +47,9 @@ def main() -> int:
                     EXTRACT(ISODOW FROM s.local_date)::int AS iso_weekday,
                     s.transaction_count,
                     s.paid_availability_probability AS current_availability,
-                    COALESCE(n.paid_availability_probability, 1.0) AS target_availability
+                    n.paid_availability_probability AS target_availability
                 FROM parking_state_hourly s
-                LEFT JOIN parking_state_hourly n
+                INNER JOIN parking_state_hourly n
                   ON n.post_id = s.post_id
                  AND n.slot_start = s.slot_start + INTERVAL '1 hour'
             )
@@ -79,14 +85,14 @@ def main() -> int:
     validation = df[(df.slot_start >= val_cut) & (df.slot_start < test_cut)]
     test = df[df.slot_start >= test_cut]
 
-    print(f"[3/5] Chronological split.")
+    print("[3/5] Chronological split.")
     print(f"      Train:      {len(train):,} rows")
     print(f"      Validation: {len(validation):,} rows")
     print(f"      Test:       {len(test):,} rows")
     if train.empty or validation.empty or test.empty:
         raise SystemExit("Chronological split produced an empty partition")
 
-    print("[4/5] Training LightGBM.")
+    print("[4/5] Training LightGBM to predict whether the next hour is free of paid occupancy.")
     import lightgbm as lgb
 
     model = lgb.LGBMClassifier(
