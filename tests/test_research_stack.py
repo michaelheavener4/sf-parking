@@ -4,11 +4,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from sf_parking.ai_features import Snapshot, build_forecast_features
+from sf_parking.ai_features import Snapshot, _visible_history, build_forecast_features
 from sf_parking.forecast import ForecastRow, LogisticFallback, brier_score, temporal_split
 from sf_parking.occupancy import PaidOccupancyEstimator, PaidTransaction
 from sf_parking.research_frontier import ObservationFrontier
 from sf_parking.spatial import Point, build_knn_graph
+from sf_parking.state import StateEvent, infer_hourly_paid_state
 from sf_parking.targets import make_next_slot_targets
 
 
@@ -31,6 +32,27 @@ def test_paid_occupancy_is_bounded_and_point_in_time():
     assert estimate.supporting_transactions == 1
 
 
+def test_hourly_state_remains_bounded_for_concurrent_ms_transactions():
+    events = [
+        StateEvent("ms", dt(9), dt(10)),
+        StateEvent("ms", dt(9), dt(10)),
+        StateEvent("ms", dt(9), dt(10)),
+    ]
+    state = infer_hourly_paid_state(events, dt(9))
+    assert state.paid_overlap_minutes == pytest.approx(180.0)
+    assert 0.0 <= state.paid_occupancy_probability <= 1.0
+    assert 0.0 <= state.paid_availability_probability <= 1.0
+    assert state.paid_occupancy_probability + state.paid_availability_probability == pytest.approx(1.0)
+
+
+def test_visible_history_truncates_future_departure():
+    tx = PaidTransaction("m", dt(9), dt(12))
+    visible = _visible_history([tx], dt(10))
+    assert len(visible) == 1
+    assert visible[0].start == dt(9)
+    assert visible[0].end == dt(10)
+
+
 def test_knn_graph_is_deterministic_and_respects_radius():
     points = [
         Point("a", 37.0, -122.0),
@@ -51,7 +73,7 @@ def test_features_use_only_prior_snapshots():
     features = build_forecast_features(snaps)
     first = features[("m", dt(9))]
     second = features[("m", dt(10))]
-    assert first[0] != first[0]  # NaN: no prior lag
+    assert first[0] != first[0]
     assert second[0] == pytest.approx(0.2)
 
 
@@ -63,6 +85,8 @@ def test_next_slot_targets_use_future_interval():
     assert targets[0].forecast_time == dt(9)
     assert targets[0].target_time == dt(10)
     assert targets[0].support_transactions == 1
+    assert 0.0 <= targets[0].probability_paid_occupied <= 1.0
+    assert 0.0 <= targets[0].target_free_probability <= 1.0
 
 
 def test_temporal_split_has_strict_time_order():
