@@ -3,15 +3,15 @@
 Usage:
     python scripts/ingest_transactions_verbose.py --window-days 90
 
-Unlike the general inventory ingestion script, this command targets the
-registered SFMTA transaction source and prints a live heartbeat after every
-committed batch so a long DataSF/Postgres run never looks stalled.
+This command targets the registered transaction adapter and prints a live
+heartbeat after every committed batch so long DataSF/Postgres runs never look
+stalled. The progress display intentionally avoids a fake percentage because
+Socrata does not provide a total row count for the filtered query up front.
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from pathlib import Path
 
@@ -69,7 +69,7 @@ def main() -> int:
     print("\n🌉 SF PARKING — SFMTA TRANSACTION INGESTION")
     print("═" * 68)
     print(f"window      : {args.window_days} days")
-    print(f"target      : {definition.target_table}")
+    print("target      : meter_transactions")
     print("source      : DataSF imvp-dq3v")
     print("batch       : 10,000 records")
     print("progress    : live heartbeat after every committed batch")
@@ -106,4 +106,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
