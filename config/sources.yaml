@@ -1,0 +1,46 @@
+# SF Parking source registry.
+#
+# Every external dataset the platform ingests is declared here. The generic
+# ingestion framework (sf_parking.ingestion) reads this file; adapters are
+# resolved by the `adapter` key against sf_parking.adapters.ADAPTERS.
+#
+# `freshness_hours` is the health-check SLA: if no successful run for a
+# source has finished within this window, the source reports as stale.
+
+version: 1
+
+sources:
+  # ---- Served by the generic adapter framework -----------------------------
+  sfmta_meter_transactions:
+    provider: datasf
+    adapter: datasf_meter_transactions
+    dataset_id: imvp-dq3v
+    description: >-
+      SFMTA Parking Meter Detailed Revenue Transactions. One row per paid
+      transaction/session at one meter (NS = new session, AT = additional
+      time). Session start/end plus payment type and amount support
+      duration, turnover, payment-behaviour and demand analysis.
+    freshness_hours: 30        # DataSF refreshes daily; allow one day of lag
+    options:
+      window_days: 7           # default incremental window when not given
+      page_size: 50000
+
+  # ---- Snapshot datasets still loaded via the legacy JSONL path ------------
+  # scripts/ingest_datasf.py + scripts/load_database.py. Declared here so the
+  # registry describes every source; migrating them onto the generic adapter
+  # framework is roadmap work, tracked in GitHub issue #1.
+  parking_meters:
+    provider: datasf
+    adapter: legacy_snapshot_jsonl
+    dataset_id: 8vzz-qzz9
+    description: SFMTA parking meter inventory (locations, active flag).
+    freshness_hours: 168
+    options: {}
+
+  meter_policies:
+    provider: datasf
+    adapter: legacy_snapshot_jsonl
+    dataset_id: qq7v-hds4
+    description: SFMTA meter operating schedules and hourly rates.
+    freshness_hours: 168
+    options: {}

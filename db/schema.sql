@@ -58,3 +58,53 @@ CREATE INDEX IF NOT EXISTS idx_meter_policies_post_id
 
 CREATE INDEX IF NOT EXISTS idx_meter_policies_space_id
     ON meter_policies (parking_space_id);
+
+-- ---------------------------------------------------------------------------
+-- Generic ingestion provenance (issue #1).
+-- One row per ingestion attempt; a failed source is always visible here as
+-- status = 'failed' with error details.
+CREATE TABLE IF NOT EXISTS ingestion_runs (
+    run_id            bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    source            text NOT NULL,
+    started_at        timestamptz NOT NULL DEFAULT now(),
+    finished_at       timestamptz,
+    status            text NOT NULL DEFAULT 'running'
+                      CHECK (status IN ('running', 'succeeded', 'failed')),
+    records_processed bigint NOT NULL DEFAULT 0,
+    records_stored    bigint NOT NULL DEFAULT 0,
+    records_skipped   bigint NOT NULL DEFAULT 0,
+    source_timestamp  timestamptz,
+    error             text
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingestion_runs_source_started
+    ON ingestion_runs (source, started_at DESC);
+
+-- SFMTA parking meter revenue transactions (DataSF imvp-dq3v).
+-- One row per paid session/extension event at one meter. Source identifiers
+-- are preserved and every record traces to its ingestion run and retrieval
+-- time. Idempotent on (transmission_id, post_id).
+CREATE TABLE IF NOT EXISTS meter_transactions (
+    transmission_id  text NOT NULL,
+    post_id          text NOT NULL,
+    street_block     text,
+    payment_type     text,
+    meter_event_type text,
+    session_start    timestamptz NOT NULL,
+    session_end      timestamptz,
+    duration_minutes integer,
+    gross_paid_amt   numeric(10, 2),
+    source           text NOT NULL,
+    run_id           bigint REFERENCES ingestion_runs(run_id),
+    retrieved_at     timestamptz NOT NULL,
+    PRIMARY KEY (transmission_id, post_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_meter_transactions_post_id
+    ON meter_transactions (post_id);
+
+CREATE INDEX IF NOT EXISTS idx_meter_transactions_session_start
+    ON meter_transactions (session_start);
+
+CREATE INDEX IF NOT EXISTS idx_meter_transactions_street_block
+    ON meter_transactions (street_block);
