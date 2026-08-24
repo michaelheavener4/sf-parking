@@ -84,11 +84,15 @@ def _serialize(value: Any) -> Any:
 
 
 def stage_table_ddl(conn: pg8000.native.Connection, target_table: str, columns: list[str]) -> str:
-    """Build a temp staging DDL whose column types mirror the target table."""
+    """Build a temp staging DDL whose column types mirror the target table.
+
+    Resolves against the connection's ``search_path`` (``current_schema()``)
+    so ingestion works in any schema, not just ``public``.
+    """
     wanted = set(columns)
     rows = conn.run(
         "SELECT column_name, data_type FROM information_schema.columns "
-        "WHERE table_name = :table AND table_schema = 'public'",
+        "WHERE table_name = :table AND table_schema = current_schema()",
         table=target_table,
     )
     types = {name: data_type for name, data_type in rows}
