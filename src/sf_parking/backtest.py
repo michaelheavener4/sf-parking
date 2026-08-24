@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from bisect import bisect_left
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -43,6 +44,8 @@ import pg8000.native
 from .features import SF_TZ, _candidate_slot_starts, _overlap_seconds
 
 BASELINE_METHOD = "deterministic_v0"
+BLOCKFACE_HOURLY_METHOD = "blockface_hourly"
+HOUR_CONDITIONED_METHOD = "hour_conditioned_v1"
 SLOT_MINUTES = 60
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
@@ -74,6 +77,7 @@ class BaselineModel(Protocol):
         slot_start: datetime,
         *,
         history_window_days: int,
+        post_id: str | None = ...,
     ) -> Prediction | None: ...
 
 
@@ -105,6 +109,7 @@ class DeterministicV0Baseline:
         slot_start: datetime,
         *,
         history_window_days: int,
+        post_id: str | None = None,
     ) -> Prediction | None:
         window_start = slot_start - timedelta(days=history_window_days)
 
@@ -148,9 +153,721 @@ class DeterministicV0Baseline:
         )
 
 
+class BlockfaceHourlyBaseline:
+    """Blockface-pooled hourly climatology with per-meter blending.
+
+    Blockface score — the occupancy ratio pooled across all meters on the
+    same blockface for the target local clock hour:
+
+        bf_occupied = Σ_meters  overlap_minutes(m, h)      (summed over all
+                                                            meters on the
+                                                            blockface)
+        bf_possible = Σ_meters  evidence_days(m) × 60      (each meter
+                                                            contributes its
+                                                            own observation
+                                                            span)
+        bf_score    = clamp(1 − bf_occupied / bf_possible, 0, 1)
+
+    The denominator is the sum of each meter's individual observable
+    meter-hours, NOT a shared constant.  A blockface with 10 meters
+    observed for 7 days each has bf_possible = 10 × 7 × 60 = 4200
+    minutes; one with 3 meters observed for 3 days has 3 × 3 × 60 = 540.
+
+    SS vs MS treatment:
+        SS (single-space) meters: post_id = one parking space.  At most
+        one concurrent session per post_id.  Occupied minutes per hour ∈
+        [0, 60].
+        MS (multi-space) meters: post_id = one pay station covering
+        potentially many spaces.  Concurrent sessions at the same post_id
+        represent different spaces.  Occupied minutes per hour can exceed
+        60.  The blockface denominator does NOT attempt to count physical
+        spaces for MS meters (the count is unknown without ms_id/space_num
+        from the source data); it counts observable meter-hours, which is
+        a conservative lower bound on true space-hours.
+
+    Blending — per-meter evidence controls the blend:
+
+        w(m) = min(evidence_days(m) / evidence_halflife, 1.0)
+        blended = w × per_meter_score + (1 − w) × bf_score
+
+    With evidence_halflife = 14 (default):
+        0 days evidence → w = 0   → pure blockface prior
+        7 days evidence → w = 0.5 → equal blend
+        14+ days        → w = 1.0 → pure per-meter
+
+    Fallbacks:
+        • No blockface assignment  → per-meter score only (deterministic_v0).
+        • Blockface has no sessions → per-meter score only.
+        • Neither has data → None (insufficient history).
+
+    Method tag: ``blockface_hourly``.
+    """
+
+    method = BLOCKFACE_HOURLY_METHOD
+
+    def __init__(self, evidence_halflife: float = 14.0) -> None:
+        self.evidence_halflife = evidence_halflife
+        self._bf_scores: dict[tuple[str, int], Prediction] = {}
+        self._meter_bf: dict[str, str] = {}
+        self._meter_type: dict[str, str | None] = {}
+        self._bf_meters: dict[str, list[str]] = {}
+        self._prepared = False
+        self._cache: dict[datetime, None] = {}  # slot_start → computed
+
+    def prepare(
+        self,
+        all_sessions: dict[str, list[tuple[datetime, datetime]]],
+        placements: dict[str, list[PlacementSpan]],
+        meter_types: dict[str, str | None],
+        *,
+        history_window_days: int,
+        slot_start: datetime,
+    ) -> None:
+        """Pre-compute blockface scores from all meters' truncated history.
+
+        Called once per (slot_start) by the harness before the per-meter
+        prediction loop.  All sessions are already truncated at slot_start.
+        Results are cached by slot_start — repeated calls for the same
+        cutoff (different meters at the same hour) are near-free.
+        """
+        if slot_start in self._cache:
+            return
+        self._cache[slot_start] = None  # mark as computed
+        window_start = slot_start - timedelta(days=history_window_days)
+
+        # 1. Map each meter to its blockface at slot_start.
+        bf_meters: dict[str, list[str]] = {}
+        for post_id, spans in placements.items():
+            placement = _placement_at(spans, slot_start)
+            if placement is not None and placement.blockface_id is not None:
+                self._meter_bf[post_id] = placement.blockface_id
+                bf_meters.setdefault(placement.blockface_id, []).append(post_id)
+        self._bf_meters = bf_meters
+        self._meter_type = meter_types
+
+        # 2. For each blockface, compute the pooled score for each local
+        #    clock hour 0–23.
+        for bf_id, bf_post_ids in bf_meters.items():
+            local_hour = slot_start.astimezone(SF_TZ).hour
+
+            # Collect all truncated sessions for meters on this blockface,
+            # along with each meter's evidence_days.
+            bf_data: list[tuple[list[tuple[datetime, datetime]], int]] = []
+            for pid in bf_post_ids:
+                sessions = all_sessions.get(pid, [])
+                hi = bisect_left([s for s, _ in sessions], slot_start)
+                history = [
+                    (s, min(e, slot_start))
+                    for s, e in sessions[:hi]
+                    if min(e, slot_start) > window_start
+                ]
+                if not history:
+                    continue
+                first_day = history[0][0].astimezone(SF_TZ).date()
+                last_day = history[-1][1].astimezone(SF_TZ).date()
+                evidence_days = max((last_day - first_day).days + 1, 1)
+                bf_data.append((history, evidence_days))
+
+            if not bf_data:
+                continue
+
+            # Compute pooled occupied minutes and pooled possible minutes.
+            bf_occupied = 0.0
+            bf_possible = 0.0
+            total_sessions = 0
+
+            for hist, ev_days in bf_data:
+                hist_starts = [s for s, _ in hist]
+                n_hist = len(hist)
+                first_day = hist[0][0].astimezone(SF_TZ).date()
+                last_day = hist[-1][1].astimezone(SF_TZ).date()
+
+                meter_occupied = 0.0
+                day = first_day
+                while day <= last_day:
+                    for lo in _candidate_slot_starts(day, local_hour):
+                        if lo < window_start or lo >= slot_start:
+                            continue
+                        j = max(
+                            bisect_left(hist_starts, lo - timedelta(days=2)) - 1,
+                            0,
+                        )
+                        while j < n_hist:
+                            s, e = hist[j]
+                            if s >= lo + timedelta(hours=1):
+                                break
+                            meter_occupied += _overlap_seconds(
+                                s, e, lo, lo + timedelta(hours=1)
+                            )
+                            j += 1
+                    day += timedelta(days=1)
+
+                bf_occupied += meter_occupied
+                bf_possible += ev_days * SLOT_MINUTES
+                total_sessions += n_hist
+
+            if bf_possible <= 0:
+                continue
+
+            self._bf_scores[(bf_id, local_hour)] = Prediction(
+                score=score_v0(bf_occupied / 60.0, bf_possible),
+                evidence_days=0,  # blockface-level; per-meter tracked separately
+                evidence_sessions=total_sessions,
+            )
+
+        self._prepared = True
+
+    def predict(
+        self,
+        sessions: list[tuple[datetime, datetime]],
+        slot_start: datetime,
+        *,
+        history_window_days: int,
+        post_id: str | None = None,
+    ) -> Prediction | None:
+        """Blended per-meter + blockface hourly availability score."""
+        # Per-meter score via the V0 formula.
+        per_meter = DeterministicV0Baseline().predict(
+            sessions, slot_start, history_window_days=history_window_days
+        )
+
+        if not self._prepared or post_id is None:
+            return per_meter
+
+        # Look up the target meter's blockface at slot_start.
+        local_hour = slot_start.astimezone(SF_TZ).hour
+        bf_id = self._meter_bf.get(post_id)
+
+        bf_pred = None
+        if bf_id is not None:
+            bf_pred = self._bf_scores.get((bf_id, local_hour))
+
+        # Blend.
+        if per_meter is not None and bf_pred is not None:
+            w = min(per_meter.evidence_days / self.evidence_halflife, 1.0)
+            blended_score = round(
+                w * per_meter.score + (1.0 - w) * bf_pred.score, 3
+            )
+            return Prediction(
+                score=blended_score,
+                evidence_days=per_meter.evidence_days,
+                evidence_sessions=per_meter.evidence_sessions,
+            )
+
+        # Fallback: use whichever estimate is available.
+        if per_meter is not None:
+            return per_meter
+        if bf_pred is not None:
+            return bf_pred
+        return None
+
+
+class HourConditionedV1Baseline:
+    """Hour-conditioned availability: pooled hour baseline + shrunk meter deviation.
+
+    Decomposes availability into a global hour-of-day component and a
+    meter-specific deviation, then shrinks the deviation toward zero
+    proportional to evidence depth.
+
+    Formula::
+
+        hour_score(h) = 1 - Σ_meters occupied(m,h) / Σ_meters possible(m,h)
+
+        meter_hour_score(m,h) = 1 - occupied(m,h) / (evidence_days(m,h) × 60)
+
+        deviation(m,h) = meter_hour_score(m,h) - hour_score(h)
+
+        w(m,h) = min(evidence_days(m,h) / evidence_halflife, 1.0)
+
+        final_score = clamp(hour_score(h) + w(m,h) × deviation(m,h), 0, 1)
+
+    where:
+
+    - ``occupied(m,h)`` = total session minutes overlapping local hour *h*
+      for meter *m*, summed over all occurrences within the evidence span.
+    - ``possible(m,h)`` = ``evidence_days(m,h) × 60``, where
+      ``evidence_days(m,h)`` is the number of distinct local calendar dates
+      on which meter *m* has at least one session overlapping hour *h*.
+    - The hour-level denominator sums possible minutes across ALL meters,
+      correctly accounting for each meter's observation coverage.
+
+    Fallbacks:
+
+    - No hour-level history at all → deterministic_v0 per-meter score.
+    - No meter-hour history → hour baseline.
+    - Neither → None.
+
+    Method tag: ``hour_conditioned_v1``.
+    """
+
+    method = HOUR_CONDITIONED_METHOD
+
+    def __init__(
+        self,
+        evidence_halflife: float = 14.0,
+        *,
+        session_index: tuple | None = None,
+    ) -> None:
+        self.evidence_halflife = evidence_halflife
+        self._slot_hour_scores: dict[datetime, dict[int, Prediction]] = {}
+        self._cache: dict[datetime, None] = {}
+        # Precomputed session-hour index: built once per prepare() call family.
+        self._session_index_built: bool = False
+        # post_id -> sorted list of (session_start, session_end, local_date,
+        #   local_hour, slot_lo, slot_hi, overlap_secs)
+        self._session_index: dict[str, list[tuple]] = {}
+        # post_id -> sorted list of session_start (for predict bisect)
+        self._session_starts: dict[str, list[datetime]] = {}
+        # (post_id, local_hour) -> list of indices into _session_index[post_id]
+        self._meter_hour_index: dict[tuple[str, int], list[int]] = {}
+        # (post_id, local_hour) -> entries sorted by lo (slot start) for
+        # bisect-based range restriction in prepare().
+        self._meter_hour_lo_entries: dict[tuple[str, int], list[tuple]] = {}
+        # post_id -> set of local_hours with data
+        self._meter_hours: dict[str, set[int]] = {}
+        # Optional pre-built index from build_session_index().
+        self._prebuilt_index: tuple | None = session_index
+
+    def _build_session_index(
+        self, all_sessions: dict[str, list[tuple[datetime, datetime]]],
+    ) -> None:
+        """One-time preprocessing: for every session, compute the local-hour
+        slots it overlaps and the (unclamped) overlap duration."""
+        if self._session_index_built:
+            return
+        self._session_index_built = True
+
+        # Use pre-built index if provided (dataset-level sharing).
+        if self._prebuilt_index is not None:
+            (
+                self._session_index,
+                self._session_starts,
+                self._meter_hour_index,
+                self._meter_hour_lo_entries,
+                self._meter_hours,
+            ) = self._prebuilt_index
+            return
+
+        # Fall back to building from scratch (with memoization).
+        (
+            self._session_index,
+            self._session_starts,
+            self._meter_hour_index,
+            self._meter_hour_lo_entries,
+            self._meter_hours,
+        ) = build_session_index(all_sessions)
+
+    # ------------------------------------------------------------------
+    # Reference (original) implementation for correctness assertions
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prepare_reference(
+        all_sessions: dict[str, list[tuple[datetime, datetime]]],
+        *,
+        history_window_days: int,
+        slot_start: datetime,
+    ) -> dict[int, Prediction]:
+        """Original prepare() calculation, returned as a dict (not stored)."""
+        window_start = slot_start - timedelta(days=history_window_days)
+        hour_occupied: dict[int, float] = {h: 0.0 for h in range(24)}
+        hour_possible: dict[int, float] = {h: 0.0 for h in range(24)}
+        hour_sessions: dict[int, int] = {h: 0 for h in range(24)}
+
+        for post_id, raw_sessions in all_sessions.items():
+            hi = bisect_left([s for s, _ in raw_sessions], slot_start)
+            history = [
+                (s, min(e, slot_start))
+                for s, e in raw_sessions[:hi]
+                if min(e, slot_start) > window_start
+            ]
+            if not history:
+                continue
+            hist_starts = [s for s, _ in history]
+            n_hist = len(history)
+            for local_hour in range(24):
+                meter_days: set[date] = set()
+                meter_occupied = 0.0
+                first_day = history[0][0].astimezone(SF_TZ).date()
+                last_day = history[-1][1].astimezone(SF_TZ).date()
+                day = first_day
+                while day <= last_day:
+                    for lo in _candidate_slot_starts(day, local_hour):
+                        if lo < window_start or lo >= slot_start:
+                            continue
+                        j = max(
+                            bisect_left(hist_starts, lo - timedelta(days=2)) - 1,
+                            0,
+                        )
+                        day_has_overlap = False
+                        while j < n_hist:
+                            s, e = history[j]
+                            if s >= lo + timedelta(hours=1):
+                                break
+                            overlap = _overlap_seconds(
+                                s, e, lo, lo + timedelta(hours=1)
+                            )
+                            if overlap > 0:
+                                day_has_overlap = True
+                                meter_occupied += overlap
+                            j += 1
+                        if day_has_overlap:
+                            slot_local = lo.astimezone(SF_TZ).date()
+                            meter_days.add(slot_local)
+                    day += timedelta(days=1)
+                ev_days = len(meter_days)
+                if ev_days > 0:
+                    hour_occupied[local_hour] += meter_occupied
+                    hour_possible[local_hour] += ev_days * SLOT_MINUTES
+                    hour_sessions[local_hour] += n_hist
+
+        hour_scores: dict[int, Prediction] = {}
+        for h in range(24):
+            if hour_possible[h] > 0:
+                hour_scores[h] = Prediction(
+                    score=score_v0(hour_occupied[h] / 60.0, hour_possible[h]),
+                    evidence_days=0,
+                    evidence_sessions=hour_sessions[h],
+                )
+        return hour_scores
+
+    # ------------------------------------------------------------------
+    # Optimized prepare()
+    # ------------------------------------------------------------------
+
+    def prepare(
+        self,
+        all_sessions: dict[str, list[tuple[datetime, datetime]]],
+        placements: dict[str, list[PlacementSpan]],
+        meter_types: dict[str, str | None],
+        *,
+        history_window_days: int,
+        slot_start: datetime,
+    ) -> None:
+        """Pre-compute hour-of-day baseline from all meters' truncated history.
+
+        Optimized: precomputes per-session local-hour overlaps once, then
+        aggregates per slot_start using indexed lookup instead of re-walking
+        the full meter × 24 × day grid.
+        """
+        if slot_start in self._cache:
+            return
+        self._cache[slot_start] = None
+
+        # Ensure the session index is built (once per model lifetime).
+        t0 = time.perf_counter()
+        self._build_session_index(all_sessions)
+        t_index = time.perf_counter() - t0
+
+        window_start = slot_start - timedelta(days=history_window_days)
+
+        hour_occupied: dict[int, float] = {h: 0.0 for h in range(24)}
+        hour_possible: dict[int, float] = {h: 0.0 for h in range(24)}
+        hour_sessions: dict[int, int] = {h: 0 for h in range(24)}
+
+        n_meters = 0
+        n_contributions = 0
+        n_candidates = 0
+        t_loop = time.perf_counter()
+        for post_id in all_sessions:
+            raw = all_sessions[post_id]
+            n_meters += 1
+            # n_hist: count of sessions that started before slot_start.
+            n_hist = bisect_left([s for s, _ in raw], slot_start)
+
+            # Iterate only hours this meter actually has sessions at.
+            for local_hour in self._meter_hours.get(post_id, set()):
+                lo_entries = self._meter_hour_lo_entries.get(
+                    (post_id, local_hour), ()
+                )
+
+                meter_days: set[date] = set()
+                meter_occupied = 0.0
+
+                # Bisect by lo (slot start) to restrict to [window_start, slot_start).
+                lo_lo = bisect_left(lo_entries, window_start, key=lambda e: e[4])
+                lo_hi = bisect_left(lo_entries, slot_start, key=lambda e: e[4])
+                n_candidates += lo_hi - lo_lo
+
+                for entry in lo_entries[lo_lo:lo_hi]:
+                    sess_s, sess_e, loc_date, _loc_h, lo, _hi, _ov_full = entry
+                    # Point-in-time: session must start before slot_start.
+                    if sess_s >= slot_start:
+                        continue
+                    # Compute overlap with truncation at slot_start.
+                    truncated_end = min(sess_e, slot_start)
+                    overlap = _overlap_seconds(
+                        sess_s, truncated_end, lo, lo + timedelta(hours=1)
+                    )
+                    if overlap > 0:
+                        meter_occupied += overlap
+                        meter_days.add(loc_date)
+                        n_contributions += 1
+
+                ev_days = len(meter_days)
+                if ev_days > 0:
+                    hour_occupied[local_hour] += meter_occupied
+                    hour_possible[local_hour] += ev_days * SLOT_MINUTES
+                    hour_sessions[local_hour] += n_hist
+
+        hour_scores: dict[int, Prediction] = {}
+        for h in range(24):
+            if hour_possible[h] > 0:
+                hour_scores[h] = Prediction(
+                    score=score_v0(hour_occupied[h] / 60.0, hour_possible[h]),
+                    evidence_days=0,
+                    evidence_sessions=hour_sessions[h],
+                )
+
+        self._slot_hour_scores[slot_start] = hour_scores
+        t_total = time.perf_counter() - t0
+        print(
+            f"[prepare] slot={slot_start.isoformat()} "
+            f"meters={n_meters} candidates={n_candidates} "
+            f"contributions={n_contributions} "
+            f"index_build={t_index:.3f}s loop={time.perf_counter() - t_loop:.3f}s "
+            f"total={t_total:.3f}s"
+        )
+
+    def predict(
+        self,
+        sessions: list[tuple[datetime, datetime]],
+        slot_start: datetime,
+        *,
+        history_window_days: int,
+        post_id: str | None = None,
+    ) -> Prediction | None:
+        """Blended hour baseline + shrunk meter deviation."""
+        local_hour = slot_start.astimezone(SF_TZ).hour
+
+        # Hour-level baseline for this specific slot_start.
+        slot_hours = self._slot_hour_scores.get(slot_start, {})
+        hour_pred = slot_hours.get(local_hour)
+
+        # Per-meter score via V0.
+        per_meter = DeterministicV0Baseline().predict(
+            sessions, slot_start, history_window_days=history_window_days
+        )
+
+        # Fallback: no hour history → use per-meter V0.
+        if hour_pred is None:
+            return per_meter
+
+        # Compute meter-hour evidence and deviation using precomputed index.
+        window_start = slot_start - timedelta(days=history_window_days)
+
+        # Count total history sessions (started before slot_start).
+        raw = sessions
+        n_hist = bisect_left([s for s, _ in raw], slot_start)
+
+        if n_hist == 0:
+            return Prediction(
+                score=hour_pred.score,
+                evidence_days=0,
+                evidence_sessions=hour_pred.evidence_sessions,
+            )
+
+        # Use precomputed index if available.
+        if post_id is not None and post_id in self._meter_hour_index:
+            meter_days: set[date] = set()
+            meter_occupied = 0.0
+            indices = self._meter_hour_index.get(post_id, [])
+            for j in indices:
+                sess_s, sess_e, loc_date, loc_h, lo, hi, ov_full = (
+                    self._session_index[post_id][j]
+                )
+                if loc_h != local_hour:
+                    continue
+                if sess_s >= slot_start:
+                    continue
+                truncated_end = min(sess_e, slot_start)
+                if truncated_end <= window_start:
+                    continue
+                overlap = _overlap_seconds(
+                    sess_s, truncated_end, lo, lo + timedelta(hours=1)
+                )
+                if overlap > 0:
+                    meter_occupied += overlap
+                    meter_days.add(loc_date)
+
+            ev_days = len(meter_days)
+            if ev_days == 0:
+                return Prediction(
+                    score=hour_pred.score,
+                    evidence_days=0,
+                    evidence_sessions=hour_pred.evidence_sessions,
+                )
+            meter_hour_score = score_v0(
+                meter_occupied / 60.0, ev_days * SLOT_MINUTES
+            )
+            deviation = meter_hour_score - hour_pred.score
+            w = min(ev_days / self.evidence_halflife, 1.0)
+            final_score = _clamp01(hour_pred.score + w * deviation)
+            return Prediction(
+                score=round(final_score, 3),
+                evidence_days=ev_days,
+                evidence_sessions=n_hist,
+            )
+
+        # Fallback: no index available (should not happen in normal flow).
+        history = [
+            (s, min(e, slot_start))
+            for s, e in raw[:n_hist]
+            if min(e, slot_start) > window_start
+        ]
+        if not history:
+            return Prediction(
+                score=hour_pred.score,
+                evidence_days=0,
+                evidence_sessions=hour_pred.evidence_sessions,
+            )
+        hist_starts = [s for s, _ in history]
+        n_hist_actual = len(history)
+        meter_days_fb: set[date] = set()
+        meter_occupied_fb = 0.0
+        first_day = history[0][0].astimezone(SF_TZ).date()
+        last_day = history[-1][1].astimezone(SF_TZ).date()
+        day = first_day
+        while day <= last_day:
+            for lo in _candidate_slot_starts(day, local_hour):
+                if lo < window_start or lo >= slot_start:
+                    continue
+                j = max(
+                    bisect_left(hist_starts, lo - timedelta(days=2)) - 1, 0
+                )
+                day_has_overlap = False
+                while j < n_hist_actual:
+                    s, e = history[j]
+                    if s >= lo + timedelta(hours=1):
+                        break
+                    overlap = _overlap_seconds(s, e, lo, lo + timedelta(hours=1))
+                    if overlap > 0:
+                        day_has_overlap = True
+                        meter_occupied_fb += overlap
+                    j += 1
+                if day_has_overlap:
+                    slot_local = lo.astimezone(SF_TZ).date()
+                    meter_days_fb.add(slot_local)
+            day += timedelta(days=1)
+        ev_days = len(meter_days_fb)
+        if ev_days == 0:
+            return Prediction(
+                score=hour_pred.score,
+                evidence_days=0,
+                evidence_sessions=hour_pred.evidence_sessions,
+            )
+        meter_hour_score = score_v0(
+            meter_occupied_fb / 60.0, ev_days * SLOT_MINUTES
+        )
+        deviation = meter_hour_score - hour_pred.score
+        w = min(ev_days / self.evidence_halflife, 1.0)
+        final_score = _clamp01(hour_pred.score + w * deviation)
+        return Prediction(
+            score=round(final_score, 3),
+            evidence_days=ev_days,
+            evidence_sessions=n_hist_actual,
+        )
+
+
 MODELS: dict[str, BaselineModel] = {
     BASELINE_METHOD: DeterministicV0Baseline(),
+    BLOCKFACE_HOURLY_METHOD: BlockfaceHourlyBaseline(),
+    HOUR_CONDITIONED_METHOD: HourConditionedV1Baseline(),
 }
+
+
+# ---------------------------------------------------------------------------
+# Dataset-level session index: built once, shared across models
+# ---------------------------------------------------------------------------
+
+# Cache keyed by id(sessions) so the same dict object is not rebuilt.
+# The cache entry holds the5 index structures produced by
+# HourConditionedV1Baseline._build_session_index.
+_session_index_cache: dict[int, tuple] = {}
+
+
+def build_session_index(
+    all_sessions: dict[str, list[tuple[datetime, datetime]]],
+) -> tuple[
+    dict[str, list[tuple]],
+    dict[str, list[datetime]],
+    dict[tuple[str, int], list[int]],
+    dict[tuple[str, int], list[tuple]],
+    dict[str, set[int]],
+]:
+    """Build the session-hour index once for a dataset.
+
+    Returns (session_index, session_starts, meter_hour_index,
+    meter_hour_lo_entries, meter_hours).  The result is cached by
+    ``id(all_sessions)`` so repeated calls with the same dict are free.
+    """
+    key = id(all_sessions)
+    if key in _session_index_cache:
+        return _session_index_cache[key]
+
+    _HOUR = timedelta(hours=1)
+    session_index: dict[str, list[tuple]] = {}
+    session_starts: dict[str, list[datetime]] = {}
+    meter_hour_index: dict[tuple[str, int], list[int]] = {}
+    meter_hour_lo_entries: dict[tuple[str, int], list[tuple]] = {}
+    meter_hours: dict[str, set[int]] = {}
+    _slot_cache: dict[tuple[date, int], list[datetime]] = {}
+
+    for post_id, raw_sessions in all_sessions.items():
+        entries: list[tuple] = []
+        starts_list: list[datetime] = []
+        for s, e in raw_sessions:
+            starts_list.append(s)
+            if e is None:
+                continue
+            s_local = s.astimezone(SF_TZ)
+            e_local = e.astimezone(SF_TZ)
+            cur = s_local.replace(minute=0, second=0, microsecond=0)
+            end_wall = e_local
+            while cur < end_wall:
+                local_date = cur.date()
+                local_hour = cur.hour
+                cache_key = (local_date, local_hour)
+                if cache_key not in _slot_cache:
+                    _slot_cache[cache_key] = _candidate_slot_starts(
+                        local_date, local_hour
+                    )
+                for lo in _slot_cache[cache_key]:
+                    slot_hi = lo + _HOUR
+                    ov = _overlap_seconds(s, e, lo, slot_hi)
+                    if ov > 0:
+                        entries.append(
+                            (s, e, local_date, local_hour, lo, slot_hi, ov)
+                        )
+                cur += _HOUR
+        entries.sort(key=lambda x: (x[0], x[4]))
+        session_index[post_id] = entries
+        session_starts[post_id] = starts_list
+        hour_indices: dict[int, list[int]] = {}
+        meter_hrs: set[int] = set()
+        for idx, entry in enumerate(entries):
+            lh = entry[3]
+            hour_indices.setdefault(lh, []).append(idx)
+            meter_hrs.add(lh)
+        for lh, indices in hour_indices.items():
+            meter_hour_index[(post_id, lh)] = indices
+        meter_hours[post_id] = meter_hrs
+        for lh, elist in hour_indices.items():
+            lo_sorted = [entries[i] for i in elist]
+            lo_sorted.sort(key=lambda x: x[4])
+            meter_hour_lo_entries[(post_id, lh)] = lo_sorted
+
+    result = (
+        session_index, session_starts, meter_hour_index,
+        meter_hour_lo_entries, meter_hours,
+    )
+    _session_index_cache[key] = result
+    return result
+
+
+def clear_session_index_cache() -> None:
+    """Drop all cached session indices (e.g. after dataset mutation)."""
+    _session_index_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -548,10 +1265,20 @@ def run_backtest(
                         )
                         j += 1
 
+                    # Prepare blockface context for models that need it.
+                    if hasattr(model, "prepare"):
+                        model.prepare(  # type: ignore[union-attr]
+                            sessions,
+                            placements,
+                            meter_types,
+                            history_window_days=history_window_days,
+                            slot_start=lo,
+                        )
                     pred = model.predict(
                         meter_sessions,
                         lo,
                         history_window_days=history_window_days,
+                        post_id=post_id,
                     )
                     if pred is None:
                         skipped_no_history += 1

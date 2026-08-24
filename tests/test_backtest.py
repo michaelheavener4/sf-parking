@@ -17,7 +17,9 @@ import pytest
 
 from sf_parking.backtest import (
     BacktestObservation,
+    BlockfaceHourlyBaseline,
     DeterministicV0Baseline,
+    HourConditionedV1Baseline,
     Prediction,
     compute_metrics,
     run_backtest,
@@ -437,6 +439,187 @@ class TestByteIdenticalSerialization:
         kwargs = {
             "until": UNTIL,
             "eval_days": 4,
+            "include_observations": True,
+        }
+        dumps = [
+            json.dumps(run_backtest(db, **kwargs).to_dict(),
+                       sort_keys=True, separators=(",", ":"))
+            for _ in range(3)
+        ]
+        assert dumps[0] == dumps[1] == dumps[2]
+
+
+class TestBlockfaceHourlyBacktest:
+    """End-to-end backtest integration with BlockfaceHourlyBaseline."""
+
+    def test_produces_valid_report(self, db):
+        _meter(db, "bf-m1")
+        _meter(db, "bf-m2")
+        for day in (17, 18, 19, 20):
+            _tx(db, "bf-m1", pt(day, 9), pt(day, 9, 30))
+            _tx(db, "bf-m2", pt(day, 13), pt(day, 14))
+        db.run("COMMIT")
+
+        report = run_backtest(
+            db,
+            until=UNTIL,
+            eval_days=4,
+            model=BlockfaceHourlyBaseline(),
+            include_observations=True,
+        )
+        assert report.method == "blockface_hourly"
+        assert report.predictions_made > 0
+        assert report.overall.n > 0
+        assert report.overall.mae is not None
+        assert report.overall.brier is not None
+        # All breakdowns should populate.
+        assert len(report.by_hour) > 0
+        assert len(report.by_weekday) > 0
+
+    def test_deterministic_across_runs(self, db):
+        _meter(db, "det-bf")
+        for day in (17, 18, 19, 20):
+            _tx(db, "det-bf", pt(day, 13), pt(day, 14))
+        db.run("COMMIT")
+
+        kwargs = {
+            "until": UNTIL,
+            "eval_days": 4,
+            "model": BlockfaceHourlyBaseline(),
+        }
+        r1 = run_backtest(db, **kwargs)
+        r2 = run_backtest(db, **kwargs)
+        assert r1 == r2
+
+    def test_method_version_in_observations(self, db):
+        _meter(db, "prov-bf")
+        _tx(db, "prov-bf", pt(18, 13), pt(18, 14))
+        db.run("COMMIT")
+
+        report = run_backtest(
+            db, until=UNTIL, eval_days=3,
+            model=BlockfaceHourlyBaseline(),
+            include_observations=True,
+        )
+        for o in report.observations:
+            assert o.method_version == "blockface_hourly"
+
+
+class TestHourConditionedBacktest:
+    """End-to-end backtest integration with HourConditionedV1Baseline."""
+
+    def test_produces_valid_report(self, db):
+        _meter(db, "hc-m1")
+        _meter(db, "hc-m2")
+        for day in (14, 15, 16, 17, 18, 19, 20):
+            _tx(db, "hc-m1", pt(day, 9), pt(day, 9, 30))
+            _tx(db, "hc-m2", pt(day, 13), pt(day, 14))
+        db.run("COMMIT")
+
+        report = run_backtest(
+            db,
+            until=UNTIL,
+            eval_days=7,
+            model=HourConditionedV1Baseline(),
+            include_observations=True,
+        )
+        assert report.method == "hour_conditioned_v1"
+        assert report.predictions_made > 0
+        assert report.overall.n > 0
+        assert report.overall.mae is not None
+        assert report.overall.brier is not None
+        assert len(report.by_hour) > 0
+        assert len(report.by_weekday) > 0
+        assert len(report.by_evidence_days_bucket) > 0
+
+    def test_deterministic_across_runs(self, db):
+        _meter(db, "hc-det")
+        for day in (14, 15, 16, 17, 18, 19, 20):
+            _tx(db, "hc-det", pt(day, 13), pt(day, 14))
+        db.run("COMMIT")
+
+        kwargs = {
+            "until": UNTIL,
+            "eval_days": 7,
+            "model": HourConditionedV1Baseline(),
+        }
+        r1 = run_backtest(db, **kwargs)
+        r2 = run_backtest(db, **kwargs)
+        assert r1 == r2
+
+    def test_method_version_in_observations(self, db):
+        _meter(db, "hc-prov")
+        _tx(db, "hc-prov", pt(18, 13), pt(18, 14))
+        db.run("COMMIT")
+
+        report = run_backtest(
+            db, until=UNTIL, eval_days=3,
+            model=HourConditionedV1Baseline(),
+            include_observations=True,
+        )
+        for o in report.observations:
+            assert o.method_version == "hour_conditioned_v1"
+
+    def test_future_transaction_does_not_change_prediction(self, db):
+        """A transaction after the cutoff cannot influence the prediction."""
+        _meter(db, "hc-leak")
+        _tx(db, "hc-leak", pt(18, 13), pt(18, 14))
+        db.run("COMMIT")
+
+        kwargs = {
+            "until": datetime(2026, 8, 19, 20, tzinfo=UTC),
+            "eval_days": 2,
+            "model": HourConditionedV1Baseline(),
+            "include_observations": True,
+        }
+        baseline = run_backtest(db, **kwargs)
+        baseline_scores = {
+            (o.post_id, o.target_hour_start): o.predicted_score
+            for o in baseline.observations
+        }
+
+        # Insert future data.
+        _tx(db, "hc-leak", pt(20, 13), pt(20, 14))
+        _tx(db, "hc-leak", pt(25, 13), pt(25, 14))
+        db.run("COMMIT")
+
+        after = run_backtest(db, **kwargs)
+        after_scores = {
+            (o.post_id, o.target_hour_start): o.predicted_score
+            for o in after.observations
+        }
+        assert after_scores == baseline_scores
+
+    def test_shared_hour_baseline_across_meters(self, db):
+        """Meters with different hour-specific availability get different
+        deviations but the same hour baseline."""
+        _meter(db, "hc-s1")
+        _meter(db, "hc-s2")
+        # Both at hour 13: s1 occupied 45 min, s2 occupied 15 min.
+        for day in (14, 15, 16, 17, 18, 19, 20):
+            _tx(db, "hc-s1", pt(day, 13), pt(day, 13, 45))
+            _tx(db, "hc-s2", pt(day, 13), pt(day, 13, 15))
+        db.run("COMMIT")
+
+        report = run_backtest(
+            db, until=UNTIL, eval_days=7,
+            model=HourConditionedV1Baseline(),
+            include_observations=True,
+        )
+        # Both meters should have observations at hour 13.
+        s1_obs = [o for o in report.observations if o.local_hour == 13]
+        assert len(s1_obs) > 0
+
+    def test_serialization_deterministic(self, db):
+        _meter(db, "hc-ser")
+        for day in (14, 15, 16, 17, 18, 19, 20):
+            _tx(db, "hc-ser", pt(day, 13), pt(day, 14))
+        db.run("COMMIT")
+
+        kwargs = {
+            "until": UNTIL,
+            "eval_days": 7,
+            "model": HourConditionedV1Baseline(),
             "include_observations": True,
         }
         dumps = [
