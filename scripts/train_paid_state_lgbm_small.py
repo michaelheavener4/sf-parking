@@ -72,8 +72,11 @@ def load_days(conn, days: list[date], rows_per_day: int, label: str) -> pd.DataF
     if not targets:
         return pd.DataFrame()
 
+    # pg8000/native uses autocommit in this project, so ON COMMIT DROP would
+    # remove the helper table immediately after CREATE. Keep it session-local
+    # and drop it explicitly after each feature query.
     conn.run("DROP TABLE IF EXISTS _ml_targets")
-    conn.run("CREATE TEMP TABLE _ml_targets (post_id text, slot_start timestamptz, target double precision, meter_type text, local_hour int, local_date date) ON COMMIT DROP")
+    conn.run("CREATE TEMP TABLE _ml_targets (post_id text, slot_start timestamptz, target double precision, meter_type text, local_hour int, local_date date)")
     buf = StringIO()
     writer = csv.writer(buf, lineterminator="\n")
     for row in targets:
@@ -103,6 +106,7 @@ def load_days(conn, days: list[date], rows_per_day: int, label: str) -> pd.DataF
      AND p24.slot_start = t.slot_start - INTERVAL '24 hours'
     """
     rows = run_query(conn, feature_sql, {}, f"PostgreSQL is fetching only T-1h and T-24h features for {label} targets.")
+    conn.run("DROP TABLE IF EXISTS _ml_targets")
     return pd.DataFrame(rows, columns=["post_id", "slot_start", "target_availability", *FEATURES])
 
 
