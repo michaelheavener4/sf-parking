@@ -9,6 +9,7 @@ from sf_parking.forecast import ForecastRow, LogisticFallback, brier_score, temp
 from sf_parking.occupancy import PaidOccupancyEstimator, PaidTransaction
 from sf_parking.research_frontier import ObservationFrontier
 from sf_parking.spatial import Point, build_knn_graph
+from sf_parking.targets import make_next_slot_targets
 
 
 def dt(hour: int) -> datetime:
@@ -16,9 +17,7 @@ def dt(hour: int) -> datetime:
 
 
 def test_frontier_clamps_to_complete_outcome_window():
-    frontier = ObservationFrontier(
-        max_session_end=dt(20), horizon=timedelta(hours=1)
-    )
+    frontier = ObservationFrontier(max_session_end=dt(20), horizon=timedelta(hours=1))
     assert frontier.safe_until == dt(19)
     assert frontier.clamp(dt(22)) == dt(19)
     assert frontier.clamp(dt(18)) == dt(18)
@@ -27,7 +26,7 @@ def test_frontier_clamps_to_complete_outcome_window():
 def test_paid_occupancy_is_bounded_and_point_in_time():
     estimator = PaidOccupancyEstimator()
     tx = PaidTransaction("m", dt(9), dt(10))
-    estimate = estimator.estimate([tx], dt(9, ))
+    estimate = estimator.estimate([tx], dt(9))
     assert 0.0 <= estimate.probability_paid_occupied <= 1.0
     assert estimate.supporting_transactions == 1
 
@@ -54,6 +53,16 @@ def test_features_use_only_prior_snapshots():
     second = features[("m", dt(10))]
     assert first[0] != first[0]  # NaN: no prior lag
     assert second[0] == pytest.approx(0.2)
+
+
+def test_next_slot_targets_use_future_interval():
+    tx = PaidTransaction("m", dt(10), dt(11))
+    targets = make_next_slot_targets(
+        [tx], forecast_times=[dt(9)], horizon_minutes=60
+    )
+    assert targets[0].forecast_time == dt(9)
+    assert targets[0].target_time == dt(10)
+    assert targets[0].support_transactions == 1
 
 
 def test_temporal_split_has_strict_time_order():
