@@ -1,0 +1,187 @@
+# Source registry for the SF Parking Intelligence platform.
+#
+# This file is intentionally descriptive rather than executable. Each adapter
+# should preserve source provenance and freshness metadata when data is stored.
+# Authority levels:
+#   authoritative = prefer for legal/operational truth
+#   primary       = first-party source, but not necessarily the sole authority
+#   supplemental  = useful corroborating/enrichment signal
+#   historical    = valuable for modeling, not current truth
+
+version: 1
+city: san_francisco
+state: CA
+country: US
+
+sources:
+  sfmta_parking_meters:
+    authority: authoritative
+    category: inventory
+    provider: SFMTA
+    dataset: 8vzz-qzz9
+    cadence: weekly
+    realtime: false
+    spatial: true
+    role: "Physical meter/post inventory, coordinates, active state, blockface linkage"
+
+  sfmta_meter_policies:
+    authority: authoritative
+    category: regulation
+    provider: SFMTA
+    dataset: qq7v-hds4
+    cadence: daily
+    realtime: false
+    spatial: false
+    role: "Effective meter schedules, rates, time limits and free periods"
+
+  sfmta_parking_regulations:
+    authority: supplemental
+    category: regulation
+    provider: SFMTA
+    dataset: hi6h-neyh
+    cadence: periodic
+    realtime: false
+    spatial: true
+    role: "Additional curb/parking regulation context; never silently overrides authoritative policy data"
+
+  sfmta_meter_transactions:
+    authority: primary
+    category: demand
+    provider: SFMTA
+    dataset: 8rah-q6mh
+    cadence: frequent_publication
+    realtime: false
+    spatial: indirect
+    role: "Parking sessions, payment behavior, turnover and demand proxies"
+
+  sfmta_parking_citations:
+    authority: primary
+    category: enforcement
+    provider: SFMTA
+    dataset: ab4h-6ztd
+    cadence: daily_lagged
+    realtime: false
+    spatial: true
+    role: "Observed enforcement events, violation geography and time-of-day enforcement signals"
+
+  sfmta_street_sweeping:
+    authority: authoritative
+    category: regulation
+    provider: SFMTA
+    dataset: yhqp-riqs
+    cadence: periodic
+    realtime: false
+    spatial: true
+    role: "Street sweeping schedules by street side/block"
+
+  sfmta_temporary_closures:
+    authority: primary
+    category: disruption
+    provider: SFMTA
+    dataset: 8x25-yybr
+    cadence: daily
+    realtime: false
+    spatial: true
+    role: "Temporary street closures, construction, events and permitted curb impacts"
+
+  sfmta_managed_offstreet:
+    authority: primary
+    category: facility
+    provider: SFMTA
+    dataset: vqzx-t7c4
+    cadence: monthly
+    realtime: false
+    spatial: true
+    role: "Static municipal garage/lot inventory, hours and facility metadata"
+
+  sfmta_garage_availability:
+    authority: primary
+    category: occupancy
+    provider: SFMTA
+    cadence: realtime
+    realtime: true
+    spatial: true
+    role: "Current public-garage availability; adapter must document the current frontend/API endpoint"
+
+  sf_rpp_eligibility:
+    authority: supplemental
+    category: regulation
+    provider: SFMTA / DataSF
+    dataset: i886-hxz9
+    cadence: periodic
+    realtime: false
+    spatial: true
+    role: "Residential permit parking eligibility context"
+
+  sfmta_parking_signs:
+    authority: supplemental
+    category: evidence
+    provider: SFMTA / DataSF
+    dataset: pigs-fac7
+    cadence: periodic
+    realtime: false
+    spatial: true
+    role: "Sign/photo evidence for future computer-vision verification"
+
+  street_parking_osm:
+    authority: supplemental
+    category: geography
+    provider: OpenStreetMap
+    dataset: street_parking
+    cadence: continuous
+    realtime: false
+    spatial: true
+    role: "Physical curb/parking topology and enrichment; never overrides SFMTA legal data without verification"
+
+  bayarea_511_traffic:
+    authority: primary
+    category: traffic
+    provider: 511 SF Bay
+    cadence: realtime
+    realtime: true
+    spatial: true
+    role: "Incidents, planned events, closures, work zones and traffic conditions"
+
+  caltrans_pems:
+    authority: primary
+    category: traffic
+    provider: Caltrans
+    cadence: realtime
+    realtime: true
+    spatial: true
+    role: "Roadway detector measurements; mostly useful as an arrival-time/congestion feature"
+
+  sfpark_historical_sensors:
+    authority: historical
+    category: occupancy
+    provider: SFMTA / SFpark
+    cadence: historical
+    realtime: false
+    spatial: true
+    role: "Historical occupancy observations for model training/validation; not current availability"
+
+  weather:
+    authority: supplemental
+    category: environment
+    provider: NWS / NOAA
+    cadence: realtime
+    realtime: true
+    spatial: true
+    role: "Weather features affecting travel and parking demand"
+
+# Future marketplace sources. These are intentionally separate from public-data
+# adapters because contracts, licensing, payments, and user-generated data have
+# different trust and privacy requirements.
+marketplace:
+  commercial_garages:
+    authority: transactional
+    category: marketplace
+    role: "Bookable commercial inventory and reservation outcomes"
+  private_parking:
+    authority: transactional
+    category: marketplace
+    role: "User-listed driveways, garages and private spaces"
+  building_inventory:
+    authority: transactional
+    category: marketplace
+    role: "Underused office/residential/commercial parking capacity"
