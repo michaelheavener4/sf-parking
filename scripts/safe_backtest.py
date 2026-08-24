@@ -12,7 +12,7 @@ right-edge evaluation when the CLI is run without an explicit --until.
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from sf_parking.backtest import MODELS, run_backtest
 from sf_parking.database import connect
@@ -27,6 +27,42 @@ def _parse_until(value: str) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
+
+
+def _print_report(report) -> None:
+    print(
+        f"Backtest — method={report.method} eval_days={report.eval_days} "
+        f"history_window={report.history_window_days}d until={report.until.isoformat()}"
+    )
+    print(
+        f"observations generated={report.observations_generated} "
+        f"predicted={report.predictions_made} "
+        f"skipped(no history)={report.skipped_no_history}"
+    )
+    o = report.overall
+    print(
+        f"overall: n={o.n} MAE={o.mae} RMSE={o.rmse} Brier={o.brier} "
+        f"mean_score={o.mean_score} proxy_avail_rate={o.proxy_availability_rate}"
+    )
+    for hour, metric in report.by_hour.items():
+        if metric.n >= report.min_samples:
+            print(f"by_hour: {hour}: n={metric.n} MAE={metric.mae}")
+    for name, metric in report.by_weekday.items():
+        if metric.n >= report.min_samples:
+            print(f"by_weekday: {name}: n={metric.n} MAE={metric.mae}")
+    for name, metric in report.by_meter_type.items():
+        if metric.n >= report.min_samples:
+            print(f"by_meter_type: {name}: n={metric.n} MAE={metric.mae}")
+    for name, metric in report.by_evidence_days_bucket.items():
+        if metric.n >= report.min_samples:
+            print(f"by_evidence_days: {name}: n={metric.n} MAE={metric.mae}")
+    if report.calibration:
+        print("calibration(vs binary proxy):")
+        for row in report.calibration:
+            print(
+                f"  {row.get('bucket')}: n={row.get('n')} "
+                f"pred={row.get('mean_pred')} obs={row.get('observed_rate')}"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -74,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
             min_samples=args.min_samples,
             model=MODELS[args.model],
         )
-        print(report.summary())
+        _print_report(report)
     finally:
         conn.close()
 
