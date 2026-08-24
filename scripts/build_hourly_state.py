@@ -56,7 +56,21 @@ def write_day(conn, day: date, query: str) -> int:
     writer = csv.writer(buffer, lineterminator="\n")
     for row in rows:
         post_id, slot, local_date, local_hour, meter_type, tx_count, minutes, prob = row
-        writer.writerow([post_id, slot, local_date, local_hour, meter_type, tx_count, minutes, prob, 1.0 - prob])
+        # pg8000 may decode numeric expressions as Decimal. Convert at the
+        # database/application boundary so COPY receives plain floats and the
+        # availability complement is numerically well-defined.
+        prob = float(prob)
+        writer.writerow([
+            post_id,
+            slot,
+            local_date,
+            local_hour,
+            meter_type,
+            tx_count,
+            float(minutes),
+            prob,
+            1.0 - prob,
+        ])
     buffer.seek(0)
 
     conn.run(
