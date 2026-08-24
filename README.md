@@ -73,4 +73,7 @@ overridden with the `DATABASE_URL` environment variable.
 Nearby-meter geographic queries available via
 `sf_parking.database.find_meters_near(latitude, longitude, radius_meters)`.
 A deterministic baseline availability score (not yet calibrated) is
-available via `sf_parking.features` — see docs/PARKING_STATE.md.
+available via `sf_parking.features` — see docs/PARKING_STATE.md. A
+point-in-time-safe backtesting harness measures it against a documented
+paid-session proxy: `python3 -m sf_parking.backtest --help` (see
+docs/BACKTESTING.md).

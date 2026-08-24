@@ -97,6 +97,9 @@ Foundation for treating sf-parking as a general SF urban data platform:
 - [x] Parking-state feature layer: deterministic per-meter features and a
       documented baseline availability score (`sf_parking.features`,
       docs/PARKING_STATE.md). Explicitly not calibrated as a probability.
+- [x] Point-in-time-safe backtesting harness for baselines with proxy-based
+      evaluation, leakage tests, and breakdown metrics
+      (sf_parking.backtest, docs/BACKTESTING.md).
 - [ ] Curb-segment geometry source; space-level coordinates (no dataset yet).
 - [ ] Migrate legacy JSONL snapshot loads onto the framework.
 - [ ] Policy-aware availability (blocked: DataSF emptied qq7v-hds4 on

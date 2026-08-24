@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import uuid
 from pathlib import Path
 
 import pg8000
@@ -52,10 +53,23 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def db():
+    # Throwaway schema so the suite never reads or wipes public/production
+    # tables (unqualified table names resolve via search_path).
+    schema = f"pytest_sf_parking_{uuid.uuid4().hex[:12]}"
     conn = connect()
+    conn.run(f'CREATE SCHEMA "{schema}"')
+    conn.run("COMMIT")
+    conn.run(f'SET search_path TO "{schema}", public')  # generated name only
     apply_schema(conn, SCHEMA_PATH)
+    conn.schema_name = schema  # for independent-connection verification below
     yield conn
     conn.close()
+    cleanup = connect()
+    try:
+        cleanup.run(f'DROP SCHEMA "{schema}" CASCADE')
+        cleanup.run("COMMIT")
+    finally:
+        cleanup.close()
 
 
 @pytest.fixture(autouse=True)
@@ -63,6 +77,18 @@ def clean_tables(db):
     yield
     db.run("TRUNCATE parking_meters, meter_policies")
     db.run("COMMIT")  # make the cleanup visible to other connections
+
+
+def _independent_connection(db):
+    """A second connection resolving the SAME throwaway schema.
+
+    Atomicity contract requires verifying from a connection that never
+    shared transaction state with the loader; it must still look in the
+    test schema rather than public.
+    """
+    other = connect()
+    other.run(f'SET search_path TO "{db.schema_name}", public')
+    return other
 
 
 def _write_jsonl(path: Path, rows) -> None:
@@ -284,7 +310,7 @@ class TestTransactionPersistence:
 
         # Independent connection: must see the committed rows even though
         # the loading connection may still hold open transactions.
-        other = connect()
+        other = _independent_connection(db)
         try:
             assert other.run("SELECT count(*) FROM parking_meters")[0][0] == 2
             row = other.run(
@@ -338,7 +364,7 @@ class TestTransactionPersistence:
             load_parking_meters(db, bad_path)
 
         # Rolled back: nothing from the failed batch persisted...
-        other = connect()
+        other = _independent_connection(db)
         try:
             posts = {
                 row[0]
