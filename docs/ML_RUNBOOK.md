@@ -7,10 +7,12 @@ cd ~/sf-parking
 python -m pip install -e '.[ml]'
 ```
 
+If your checkout reports `does not provide the extra 'ml'`, run `git pull --ff-only` first. The current `pyproject.toml` defines the ML extra.
+
 ## 2. Run the complete spatial/dynamic tournament
 
 ```bash
-PYTHONPATH="$PWD/src" python scripts/train_spatial_paid_state.py \
+PYTHONPATH="$PWD/src:$PWD/scripts" python scripts/train_spatial_paid_state.py \
   --train-days 90 \
   --validation-days 7 \
   --test-days 7 \
@@ -21,34 +23,39 @@ PYTHONPATH="$PWD/src" python scripts/train_spatial_paid_state.py \
   --neighbor-radius-m 250
 ```
 
-The script compares the candidate against persistence and hour climatology and prints performance on the difficult subset (`actual availability < 90%`) plus each local hour.
+The tournament compares:
 
-## 3. Promote only after the gates pass
+1. persistence (`t+1 = latest observed state`)
+2. hour-conditioned climatology
+3. the existing 15-feature LightGBM
+4. the 31-feature spatial/dynamic LightGBM
 
-```bash
-PYTHONPATH="$PWD/src" python scripts/train_spatial_paid_state.py --promote
-```
+It reports overall MAE/RMSE plus availability bands, transition periods, daytime, and peak-evening performance.
 
-Promotion requires aggregate performance not to regress materially and positive improvement over persistence on a sufficiently large difficult subset.
+The spatial candidate is automatically promoted only when it beats both the current LightGBM and persistence overall **and** beats both on the transition regime with at least 100 transition observations. Otherwise the candidate remains isolated and production is unchanged. The process exits `3` when the promotion gate fails; that is an intentional scientific result, not a crash.
 
-## 4. Generate a spatial/dynamic T+1 forecast
+## 3. Generate spatial/dynamic T+1 forecasts
+
+Only run this after a candidate has been promoted:
 
 ```bash
 PYTHONPATH="$PWD/src" python scripts/forecast_spatial_paid_state.py
 ```
 
-This is deliberately T+1 only. The established recursive model remains the safe T+2–T+24 path until recursive spatial features are explicitly validated.
+The spatial model is deliberately T+1 only. The established recursive model remains the safe T+2–T+24 path until recursive spatial features are explicitly validated.
 
-## 5. Fit probability calibration after forecasts mature
+## 4. Probability calibration
+
+After forecasts have matured:
 
 ```bash
 PYTHONPATH="$PWD/src" python scripts/fit_parking_probability_calibrator.py \
   --threshold 0.50
 ```
 
-Calibration is an empirical estimate of `P(actual availability >= 50%)`; it is not allowed to silently reuse the training labels.
+Calibration estimates `P(actual availability >= 50%)` from matured held-out forecasts. Raw regression output is never described as a probability without calibration.
 
-## 6. Use the decision engine
+## 5. Decision engine
 
 ```bash
 PYTHONPATH="$PWD/src" python scripts/find_parking_intelligent.py \
@@ -57,9 +64,9 @@ PYTHONPATH="$PWD/src" python scripts/find_parking_intelligent.py \
   --radius 250 --top 10
 ```
 
-The finder reports the best individual opportunities and a correlated neighborhood success estimate. It never silently jumps to a later forecast slot.
+The finder ranks opportunities using forecast probability and distance, and reports a correlated neighborhood success estimate. It never silently jumps to a different forecast slot.
 
-## 7. Monitor production health
+## 6. Production health
 
 ```bash
 PYTHONPATH="$PWD/src" python scripts/check_ml_health.py --hours 48
@@ -67,4 +74,4 @@ PYTHONPATH="$PWD/src" python scripts/check_ml_health.py --hours 48
 
 ## Promotion philosophy
 
-Never optimize aggregate MAE alone. The model is useful when it predicts transitions. A model that improves the 30–90% availability regime and peak-demand hours while preserving calibration is more valuable than one that reduces error on an overwhelmingly 100%-available test set.
+Never optimize aggregate MAE alone. The model is useful when it predicts transitions and high-demand states. A model that improves the 30–90% availability regime and peak-demand hours while preserving calibration is more valuable than one that merely reduces error on an overwhelmingly 100%-available test set.
