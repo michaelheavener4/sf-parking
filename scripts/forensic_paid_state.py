@@ -192,7 +192,6 @@ def main() -> int:
         if first is None:
             raise RuntimeError("parking_state_hourly is empty")
 
-        latest = min(latest, datetime.now(latest.tzinfo) if getattr(latest, "tzinfo", None) else latest)
         default_start = max(first, latest - timedelta(days=args.days - 1))
 
         windows: dict[str, dict] = {
@@ -207,6 +206,8 @@ def main() -> int:
         for name, start_raw, end_raw in split_args:
             if start_raw and end_raw:
                 windows[name] = run_window(conn, parse_dt(start_raw), parse_dt(end_raw))
+
+        candidate_upstream_tables = inventory(conn)
     finally:
         conn.close()
 
@@ -214,7 +215,7 @@ def main() -> int:
         "version": 2,
         "transition_definition": "same post_id at exact target_slot_start - 1 hour",
         "windows": windows,
-        "candidate_upstream_tables": inventory(connect()),
+        "candidate_upstream_tables": candidate_upstream_tables,
     }
 
     path = Path(args.output)
@@ -229,7 +230,10 @@ def main() -> int:
         print(f"  target rows: {c['target_rows']:,}")
         print(f"  exact T-1h pairs: {s.get('n_exact_hour_pairs', 0):,}")
         print(f"  missing exact T-1h: {c['missing_exact_prev_hour']:,}")
-        print(f"  exact-prev coverage: {c['exact_prev_hour_coverage']:.2%}" if c['exact_prev_hour_coverage'] is not None else "  exact-prev coverage: n/a")
+        if c['exact_prev_hour_coverage'] is not None:
+            print(f"  exact-prev coverage: {c['exact_prev_hour_coverage']:.2%}")
+        else:
+            print("  exact-prev coverage: n/a")
         if s.get("n_exact_hour_pairs"):
             print(f"  Mean |Δ|: {s['mean_abs_delta']:.8f}")
             print(f"  Unchanged: {s['fraction_exactly_unchanged']:.2%}")
