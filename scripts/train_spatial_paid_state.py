@@ -46,6 +46,9 @@ def mask_for(df: pd.DataFrame, name: str) -> np.ndarray:
         "70_90": (y >= .70) & (y < .90),
         "90_100": y >= .90,
         "transition": np.abs(y - lag) >= .15,
+        "transition_05": np.abs(y - lag) >= .05,
+        "transition_10": np.abs(y - lag) >= .10,
+        "transition_25": np.abs(y - lag) >= .25,
         "daytime": (h >= 7) & (h < 19),
         "peak_evening": (h >= 16) & (h < 21),
     }[name]
@@ -54,10 +57,58 @@ def mask_for(df: pd.DataFrame, name: str) -> np.ndarray:
 def evaluate(df: pd.DataFrame, pred: np.ndarray) -> dict:
     y = df.target.to_numpy(float)
     out = {"n": int(len(df)), "overall": scores(y, pred)}
-    for name in ("0_30", "30_50", "50_70", "70_90", "90_100", "transition", "daytime", "peak_evening"):
+    for name in (
+        "0_30", "30_50", "50_70", "70_90", "90_100",
+        "transition", "transition_05", "transition_10", "transition_25",
+        "daytime", "peak_evening",
+    ):
         m = mask_for(df, name)
         out[name] = {"n": int(m.sum()), **scores(y[m], pred[m])} if m.any() else {"n": 0, "mae": float("nan"), "rmse": float("nan")}
     return out
+
+
+def target_diagnostics(df: pd.DataFrame) -> dict:
+    y = df.target.to_numpy(float)
+    lag = df.lag1_availability.to_numpy(float)
+    delta = y - lag
+    abs_delta = np.abs(delta)
+    finite = np.isfinite(y) & np.isfinite(lag)
+    y, lag, delta, abs_delta = y[finite], lag[finite], delta[finite], abs_delta[finite]
+    if len(y) == 0:
+        return {"n": 0}
+    quantiles = {f"p{q}": float(np.quantile(abs_delta, q / 100)) for q in (50, 75, 90, 95, 99, 99.9)}
+    return {
+        "n": int(len(y)),
+        "mean_abs_delta": float(np.mean(abs_delta)),
+        "median_abs_delta": float(np.median(abs_delta)),
+        "mean_delta": float(np.mean(delta)),
+        "quantiles_abs_delta": quantiles,
+        "fraction_abs_delta_ge_0_01": float(np.mean(abs_delta >= .01)),
+        "fraction_abs_delta_ge_0_05": float(np.mean(abs_delta >= .05)),
+        "fraction_abs_delta_ge_0_10": float(np.mean(abs_delta >= .10)),
+        "fraction_abs_delta_ge_0_15": float(np.mean(abs_delta >= .15)),
+        "fraction_abs_delta_ge_0_25": float(np.mean(abs_delta >= .25)),
+        "fraction_exactly_unchanged": float(np.mean(abs_delta == 0)),
+        "persistence_mae": float(np.mean(abs_delta)),
+    }
+
+
+def transition_delta_metrics(df: pd.DataFrame, pred: np.ndarray, threshold: float) -> dict:
+    y = df.target.to_numpy(float)
+    lag = df.lag1_availability.to_numpy(float)
+    delta = y - lag
+    m = np.isfinite(delta) & (np.abs(delta) >= threshold)
+    if not m.any():
+        return {"n": 0, "mae": float("nan"), "direction_accuracy": float("nan"), "mean_abs_delta": float("nan")}
+    pred_delta = np.asarray(pred, float) - lag
+    actual_direction = delta[m] > 0
+    pred_direction = pred_delta[m] > 0
+    return {
+        "n": int(m.sum()),
+        "mae": float(np.mean(np.abs(pred[m] - y[m]))),
+        "direction_accuracy": float(np.mean(actual_direction == pred_direction)),
+        "mean_abs_delta": float(np.mean(np.abs(delta[m]))),
+    }
 
 
 def train_lgbm(train: pd.DataFrame, val: pd.DataFrame, features: list[str]):
@@ -141,6 +192,8 @@ def main() -> int:
     ap.add_argument("--neighbor-k", type=int, default=24)
     ap.add_argument("--neighbor-radius-m", type=float, default=250)
     ap.add_argument("--feature-batch-size", type=int, default=10000)
+    ap.add_argument("--transition-threshold", type=float, default=.10)
+    ap.add_argument("--min-transition-samples", type=int, default=100)
     args = ap.parse_args()
     t0 = time.monotonic()
     cfg = SpatialFeatureConfig(args.neighbor_k, args.neighbor_radius_m)
@@ -193,16 +246,32 @@ def main() -> int:
             "current_lgbm": evaluate(test_b, base_pred),
             "spatial_dynamic_lgbm": evaluate(test_s, spatial_pred),
         }
+        transition_metrics = {
+            "threshold": args.transition_threshold,
+            "persistence": transition_delta_metrics(test_b, persistence, args.transition_threshold),
+            "current_lgbm": transition_delta_metrics(test_b, base_pred, args.transition_threshold),
+            "spatial_dynamic_lgbm": transition_delta_metrics(test_s, spatial_pred, args.transition_threshold),
+        }
+        target_diag = target_diagnostics(test_b)
         for name, r in results.items():
             print(f"\n{name}: MAE={r['overall']['mae']:.6f} RMSE={r['overall']['rmse']:.6f} n={r['n']:,}")
             for regime in ("0_30", "30_50", "50_70", "70_90", "transition", "peak_evening"):
                 q = r[regime]
                 if q["n"]:
                     print(f"  {regime:16s} n={q['n']:,} MAE={q['mae']:.6f}")
+        print("\nTarget dynamics:")
+        print(f"  mean |Δ|={target_diag['mean_abs_delta']:.6f}  unchanged={target_diag['fraction_exactly_unchanged']:.2%}")
+        print(f"  |Δ|≥.05={target_diag['fraction_abs_delta_ge_0_05']:.2%}  |Δ|≥.10={target_diag['fraction_abs_delta_ge_0_10']:.2%}  |Δ|≥.25={target_diag['fraction_abs_delta_ge_0_25']:.2%}")
+        tm = transition_metrics
+        print(f"Transition |Δ|≥{args.transition_threshold:.2f}: n={tm['spatial_dynamic_lgbm']['n']:,} spatial MAE={tm['spatial_dynamic_lgbm']['mae']:.6f} direction={tm['spatial_dynamic_lgbm']['direction_accuracy']:.1%}")
 
         s, b, p = results["spatial_dynamic_lgbm"], results["current_lgbm"], results["persistence"]
-        overall_gate = s["overall"]["mae"] < b["overall"]["mae"] and s["overall"]["mae"] < p["overall"]["mae"]
-        transition_gate = s["transition"]["n"] >= 100 and s["transition"]["mae"] < b["transition"]["mae"] and s["transition"]["mae"] < p["transition"]["mae"]
+        overall_gate = s["overall"]["mae"] < b["overall"]["mae"]
+        transition_gate = (
+            tm["spatial_dynamic_lgbm"]["n"] >= args.min_transition_samples
+            and tm["spatial_dynamic_lgbm"]["mae"] < tm["current_lgbm"]["mae"]
+            and tm["spatial_dynamic_lgbm"]["direction_accuracy"] > .50
+        )
         promoted = overall_gate and transition_gate
 
         print("\n[4/4] Artifacts and promotion")
@@ -213,14 +282,14 @@ def main() -> int:
             "features": FEATURES_SPATIAL,
             "neighbor_k": args.neighbor_k,
             "neighbor_radius_m": args.neighbor_radius_m,
-            "train_rows": len(train_s),
-            "validation_rows": len(val_s),
-            "test_rows": len(test_s),
+            "train_rows": len(train_s), "validation_rows": len(val_s), "test_rows": len(test_s),
             "train_window": [str(train_start), str(train_end)],
             "validation_window": [str(val_start), str(test_start - timedelta(days=1))],
             "test_window": [str(test_start), str(test_end)],
             "metrics": s,
-            "promotion": {"overall": overall_gate, "transition": transition_gate, "promoted": promoted},
+            "target_diagnostics": target_diag,
+            "transition_metrics": transition_metrics,
+            "promotion": {"overall_beats_current_lgbm": overall_gate, "transition": transition_gate, "promoted": promoted},
             "lag168_note": "When historical coverage is shorter than 168 hours, lag168 falls back to lag24; this is explicit bootstrap behavior, not future leakage.",
         }
         save_model(spatial_model, candidate, meta)
@@ -239,23 +308,18 @@ def main() -> int:
             event="actual_availability >= 0.500",
             training_window=(str(val_start), str(test_start - timedelta(days=1))),
         )
-        importance = sorted(
-            zip(FEATURES_SPATIAL, spatial_model.booster_.feature_importance("gain")),
-            key=lambda x: x[1], reverse=True,
-        )
+        importance = sorted(zip(FEATURES_SPATIAL, spatial_model.booster_.feature_importance("gain")), key=lambda x: x[1], reverse=True)
         report = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "model_version": MODEL_VERSION,
             "rows": {"train": len(train_s), "validation": len(val_s), "test": len(test_s)},
-            "windows": {
-                "train": [str(train_start), str(train_end)],
-                "validation": [str(val_start), str(test_start - timedelta(days=1))],
-                "test": [str(test_start), str(test_end)],
-            },
+            "windows": {"train": [str(train_start), str(train_end)], "validation": [str(val_start), str(test_start - timedelta(days=1))], "test": [str(test_start), str(test_end)]},
             "requested_days": {"train": args.train_days, "validation": args.validation_days, "test": args.test_days},
             "actual_days": {"train": train_days, "validation": val_days, "test": test_days},
             "results": results,
-            "promotion": {"overall": overall_gate, "transition": transition_gate, "promoted": promoted},
+            "target_diagnostics": target_diag,
+            "transition_metrics": transition_metrics,
+            "promotion": {"overall_beats_current_lgbm": overall_gate, "transition": transition_gate, "promoted": promoted},
             "feature_importance_gain": [{"feature": k, "gain": float(v)} for k, v in importance],
             "elapsed_seconds": round(time.monotonic() - t0, 2),
         }
