@@ -5,6 +5,10 @@ V4 fixes four benchmark-harness issues:
 - direct execution from repo root;
 - partial latest local days are excluded from rolling-origin test folds;
 - the original fold generator is preserved before V4 overrides it.
+
+Capacity and blockface identity come from the same parking_meters relation so
+we do not assume parking_spaces.blockface_id uses the identical identifier
+namespace.
 """
 from __future__ import annotations
 
@@ -35,13 +39,14 @@ def normalized_mapping_sql() -> str:
 
 
 def normalized_targets(conn, start, end, k, seed):
-    return conn.run(
+    rows = conn.run(
         f"""
         WITH mapping AS ({normalized_mapping_sql()}), capacity AS (
             SELECT blockface_id::text AS blockface_id,
                    COUNT(DISTINCT parking_space_id)::int AS capacity
-            FROM parking_spaces
+            FROM parking_meters
             WHERE blockface_id IS NOT NULL
+              AND parking_space_id IS NOT NULL
             GROUP BY blockface_id
         ), slots AS (
             SELECT DISTINCT
@@ -75,6 +80,42 @@ def normalized_targets(conn, start, end, k, seed):
         end=end,
         seed=str(seed),
         k=k,
+    )
+    if rows:
+        return rows
+
+    # Explicit diagnostic so an empty population is never mistaken for a model result.
+    diag = conn.run(
+        f"""
+        WITH mapping AS ({normalized_mapping_sql()}),
+        mapped_slots AS (
+            SELECT DISTINCT m.blockface_id, s.slot_start
+            FROM mapping m
+            JOIN parking_state_hourly s ON s.post_id::text = m.post_id
+            WHERE s.slot_start >= :start AND s.slot_start < :end
+        ),
+        capacity AS (
+            SELECT blockface_id::text AS blockface_id,
+                   COUNT(DISTINCT parking_space_id)::int AS capacity
+            FROM parking_meters
+            WHERE blockface_id IS NOT NULL AND parking_space_id IS NOT NULL
+            GROUP BY blockface_id
+        )
+        SELECT
+            (SELECT COUNT(*) FROM mapping)::int AS mapping_rows,
+            (SELECT COUNT(DISTINCT blockface_id) FROM mapping)::int AS mapped_blockfaces,
+            (SELECT COUNT(*) FROM mapped_slots)::int AS mapped_slots,
+            (SELECT COUNT(*) FROM capacity WHERE capacity > 0)::int AS capacity_blockfaces,
+            (SELECT COUNT(*) FROM mapped_slots ms JOIN capacity c USING(blockface_id) WHERE c.capacity > 0)::int AS eligible_slots
+        """,
+        start=start,
+        end=end,
+    )[0]
+    raise RuntimeError(
+        "No eligible blockface targets for test window "
+        f"{start.isoformat()} → {end.isoformat()}. "
+        f"diagnostic={{'mapping_rows':{diag[0]},'mapped_blockfaces':{diag[1]},"
+        f"'mapped_slots':{diag[2]},'capacity_blockfaces':{diag[3]},'eligible_slots':{diag[4]}}}"
     )
 
 
