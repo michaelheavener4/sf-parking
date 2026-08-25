@@ -87,11 +87,17 @@ def learn_rates(conn, train_start: datetime, train_end: datetime) -> dict[str, o
         SELECT post_id,
                AVG(EXTRACT(EPOCH FROM (session_end - session_start)) / 3600.0) AS mean_duration_h,
                COUNT(*)::double precision AS sessions,
-               COUNT(*)::double precision / GREATEST(EXTRACT(EPOCH FROM (:end - :start)) / 3600.0, 1.0) AS baseline_arrival_h
+               COUNT(*)::double precision /
+                 GREATEST(
+                     EXTRACT(EPOCH FROM (
+                         CAST(:end AS timestamptz) - CAST(:start AS timestamptz)
+                     )) / 3600.0,
+                     1.0
+                 ) AS baseline_arrival_h
         FROM meter_transactions
-        WHERE session_start >= :start
+        WHERE session_start >= CAST(:start AS timestamptz)
           AND session_end IS NOT NULL
-          AND session_end <= :end
+          AND session_end <= CAST(:end AS timestamptz)
           AND session_end > session_start
         GROUP BY post_id
     """, start=train_start, end=train_end)
@@ -105,8 +111,8 @@ def learn_rates(conn, train_start: datetime, train_end: datetime) -> dict[str, o
                EXTRACT(ISODOW FROM (session_start AT TIME ZONE 'America/Los_Angeles'))::int AS dow,
                COUNT(*)::double precision AS arrivals
         FROM meter_transactions
-        WHERE session_start >= :start
-          AND session_start < :end
+        WHERE session_start >= CAST(:start AS timestamptz)
+          AND session_start < CAST(:end AS timestamptz)
         GROUP BY 1, 2
     """, start=train_start, end=train_end)
     days = max(1.0, (train_end - train_start).total_seconds() / 86400.0)
@@ -119,122 +125,10 @@ def learn_rates(conn, train_start: datetime, train_end: datetime) -> dict[str, o
     global_duration = conn.run("""
         SELECT AVG(EXTRACT(EPOCH FROM (session_end - session_start)) / 3600.0)
         FROM meter_transactions
-        WHERE session_start >= :start
+        WHERE session_start >= CAST(:start AS timestamptz)
           AND session_end IS NOT NULL
-          AND session_end <= :end
+          AND session_end <= CAST(:end AS timestamptz)
           AND session_end > session_start
     """, start=train_start, end=train_end)[0][0]
     global_duration_h = float(global_duration) if global_duration is not None and float(global_duration) > 0 else 1.5
     return {"post": durations, "seasonality": seasonality, "global_duration_h": global_duration_h, "baseline_hourly_rate": baseline}
-
-
-def sample_targets(conn, start: datetime, end: datetime, limit_rows: int, seed: int):
-    # Target contains y(T), but every predictor is explicitly from T-1.
-    return conn.run("""
-        SELECT
-            t.post_id,
-            t.slot_start,
-            t.paid_availability_probability AS target_availability,
-            p.paid_availability_probability AS lag1_availability,
-            p.transaction_count AS lag1_transactions,
-            t.local_hour,
-            t.local_date
-        FROM parking_state_hourly t
-        JOIN parking_state_hourly p
-          ON p.post_id = t.post_id
-         AND p.slot_start = t.slot_start - INTERVAL '1 hour'
-        WHERE t.slot_start >= :start
-          AND t.slot_start < :end
-        ORDER BY hashtext(t.post_id || '|' || t.slot_start::text || :seed::text), t.post_id, t.slot_start
-        LIMIT :limit_rows
-    """, start=start, end=end, seed=str(seed), limit_rows=limit_rows)
-
-
-def predict(targets, rates: dict[str, object], horizon_hours: float) -> pd.DataFrame:
-    rows = []
-    post_rates = rates["post"]
-    seasonality = rates["seasonality"]
-    global_duration = float(rates["global_duration_h"])
-    global_lambda = float(rates["baseline_hourly_rate"])
-    for post_id, slot, target, lag_availability, lag_tx1, hour, local_date in targets:
-        params = post_rates.get(str(post_id))
-        if params is None:
-            duration_h = global_duration
-            post_lambda = global_lambda
-        else:
-            duration_h = 0.8 * float(params["mean_duration_h"]) + 0.2 * global_duration
-            post_lambda = 0.8 * float(params["baseline_arrival_h"]) + 0.2 * global_lambda
-        season = float(seasonality.get((int(hour), int(pd.Timestamp(local_date).isoweekday())), 1.0))
-        recent = max(0.0, float(lag_tx1))
-        lam = 0.55 * post_lambda * season + 0.45 * recent
-        pred = availability_forecast(float(lag_availability), lam, duration_h, horizon_hours)
-        rows.append((str(post_id), slot, float(target), float(lag_availability), float(pred), lam, duration_h, recent))
-    return pd.DataFrame(rows, columns=["post_id", "slot_start", "target_availability", "lag1_availability", "predicted_availability", "arrival_rate_h", "duration_h", "recent_tx1"])
-
-
-def run_fold(conn, fold, args, idx):
-    rates = learn_rates(conn, *fold["train"])
-    targets = sample_targets(conn, *fold["test"], args.max_test_rows, 4000 + idx)
-    df = predict(targets, rates, args.horizon_hours)
-    if df.empty:
-        raise RuntimeError(f"fold {idx}: empty test sample")
-    keep = np.isfinite(df["lag1_availability"].to_numpy(float)) & np.isfinite(df["target_availability"].to_numpy(float))
-    df = df.loc[keep].reset_index(drop=True)
-    y = df.target_availability.to_numpy(float)
-    lag = df.lag1_availability.to_numpy(float)
-    pred = df.predicted_availability.to_numpy(float)
-    return {
-        "fold": idx,
-        "local_days": fold["local_days"],
-        "rows": int(len(df)),
-        "dynamics": metric(y, pred),
-        "persistence": metric(y, lag),
-        "transitions": {str(t): transition_metrics(y, lag, pred, t) for t in (0.05, 0.10, 0.25)},
-        "mean_arrival_rate_h": float(df.arrival_rate_h.mean()),
-        "mean_duration_h": float(df.duration_h.mean()),
-    }
-
-
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--train-days", type=int, default=6)
-    ap.add_argument("--validation-days", type=int, default=1)
-    ap.add_argument("--test-days", type=int, default=1)
-    ap.add_argument("--max-folds", type=int, default=10)
-    ap.add_argument("--max-test-rows", type=int, default=75000)
-    ap.add_argument("--horizon-hours", type=float, default=1.0)
-    args = ap.parse_args()
-
-    print("🚦 SF PARKING — FIRST-PRINCIPLES OCCUPANCY DYNAMICS V1")
-    conn = connect()
-    try:
-        first, latest = conn.run("SELECT min(slot_start), max(slot_start) FROM parking_state_hourly WHERE slot_start <= NOW()")[0]
-        fs = make_folds(first, latest, args.train_days, args.validation_days, args.test_days, args.max_folds)
-        print(f"Local data: {first.astimezone(TZ).date()} → {latest.astimezone(TZ).date()}; folds={len(fs)}")
-        reports = []
-        for i, fold in enumerate(fs, 1):
-            print(f"\n[Fold {i}/{len(fs)}] {fold['local_days']}")
-            reports.append(run_fold(conn, fold, args, i))
-    finally:
-        conn.close()
-
-    w = np.array([r["rows"] for r in reports], float)
-    dm = float(np.average([r["dynamics"]["mae"] for r in reports], weights=w))
-    pm = float(np.average([r["persistence"]["mae"] for r in reports], weights=w))
-    result = {
-        "version": 1,
-        "model": "two_state_arrival_departure_hazard",
-        "ground_truth": "exact same-post T-1 hour; targets use y(T), predictors use only T-1 and training-window transaction history",
-        "folds": reports,
-        "aggregate": {"test_rows": int(sum(w)), "persistence_mae": pm, "dynamics_mae": dm, "improvement_over_persistence": (pm - dm) / pm if pm else None},
-    }
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
-    print("\nFINAL:")
-    print(json.dumps(result["aggregate"], indent=2))
-    print(f"Report: {OUT}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
