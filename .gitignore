@@ -8,3 +8,7 @@ __pycache__/
 # Downloaded DataSF snapshots; regenerate with scripts/ingest_datasf.py.
 data/raw/*.jsonl
 data/raw/manifest.json
+
+# Trained model artifacts; regenerate with benchmark scripts.
+models/*.txt
+models/*.meta.json

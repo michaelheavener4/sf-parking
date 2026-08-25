@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import subprocess
 import threading
 import time
-from datetime import date, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import StringIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -23,6 +25,7 @@ FEATURES = [
     "roll24_availability", "hour_sin", "hour_cos", "weekday_sin",
     "weekday_cos", "is_ms",
 ]
+MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
 
 
 def heartbeat(message: str, stop: threading.Event) -> None:
@@ -143,11 +146,38 @@ def train_model(train: pd.DataFrame, validation: pd.DataFrame):
     return model
 
 
+def save_model(model, model_dir: Path, mm: float, mr: float, pm: float, pr: float,
+               train_rows: int, val_rows: int, test_rows: int) -> Path:
+    """Persist the fitted model and metadata to *model_dir*."""
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / "paid_state_lgbm.txt"
+    meta_path = model_dir / "paid_state_lgbm.meta.json"
+    model.booster_.save_model(str(model_path))
+    meta = {
+        "model_version": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        "training_timestamp": datetime.now(timezone.utc).isoformat(),
+        "features": FEATURES,
+        "train_rows": train_rows,
+        "validation_rows": val_rows,
+        "test_rows": test_rows,
+        "model_mae": round(mm, 6),
+        "model_rmse": round(mr, 6),
+        "persistence_mae": round(pm, 6),
+        "persistence_rmse": round(pr, 6),
+        "best_iteration": getattr(model, "best_iteration_", None),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    print(f"\n💾 Model saved to {model_path}")
+    print(f"💾 Metadata saved to {meta_path}")
+    return model_path
+
+
 def main() -> int:
     p=argparse.ArgumentParser()
     p.add_argument("--test-days",type=int,default=7); p.add_argument("--validation-days",type=int,default=14)
     p.add_argument("--max-train-rows",type=int,default=1_000_000); p.add_argument("--seed",type=int,default=42)
     p.add_argument("--feature-chunk-size",type=int,default=10_000); p.add_argument("--sample-per-day",type=int,default=14_500)
+    p.add_argument("--model-dir",type=Path,default=MODEL_DIR,help="Directory for saved model and metadata")
     args=p.parse_args(); started=time.monotonic()
     print("🌉 SF PARKING — CHUNKED REPRESENTATIVE 7-DAY LIGHTGBM")
     print("════════════════════════════════════════════════════════════════════")
@@ -192,6 +222,7 @@ def main() -> int:
     y=np.concatenate(all_y) if all_y else np.array([]); pred=np.concatenate(all_pred) if all_pred else np.array([]); persist=np.concatenate(all_persist) if all_persist else np.array([]); clim=np.concatenate(all_clim) if all_clim else np.array([])
     mm,mr=metric_arrays(y,pred);pm,pr=metric_arrays(y,persist);cm,cr=metric_arrays(y,clim)
     print("\n[5/5] Final benchmark."); print(f"      train_rows={len(train):,}"); print(f"      validation_rows={len(validation):,}"); print(f"      test_rows={test_rows:,}"); print(f"      model:        MAE={mm:.6f} RMSE={mr:.6f}"); print(f"      persistence:  MAE={pm:.6f} RMSE={pr:.6f}"); print(f"      climatology:  MAE={cm:.6f} RMSE={cr:.6f}"); print(f"      gain_vs_persistence_mae={pm-mm:.6f}"); print(f"      gain_vs_climatology_mae={cm-mm:.6f}"); print(f"      best_iteration={getattr(model,'best_iteration_',None)}"); print(f"\n✅ COMPLETE — elapsed {int(time.monotonic()-started)}s")
+    save_model(model, args.model_dir, mm, mr, pm, pr, len(train), len(validation), test_rows)
     text=f"model_mae={mm:.6f}\nmodel_rmse={mr:.6f}\npersistence_mae={pm:.6f}\npersistence_rmse={pr:.6f}\nclimatology_mae={cm:.6f}\nclimatology_rmse={cr:.6f}\ngain_vs_persistence_mae={pm-mm:.6f}\ngain_vs_climatology_mae={cm-mm:.6f}\ntrain_rows={len(train)}\nvalidation_rows={len(validation)}\ntest_rows={test_rows}\n"
     try: subprocess.run(["pbcopy"],input=text,text=True,check=True); print("📋 Results copied to macOS clipboard.")
     except (OSError,subprocess.CalledProcessError): print("⚠️ Clipboard copy failed.")

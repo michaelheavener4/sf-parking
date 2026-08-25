@@ -24,7 +24,6 @@ posts AS (
     FROM _state_post_spans s
     CROSS JOIN params p
     WHERE s.first_local_date <= (p.day_end AT TIME ZONE 'America/Los_Angeles')::date
-      AND s.last_local_date  >= (p.day_start AT TIME ZONE 'America/Los_Angeles')::date
 ),
 grid AS (
     SELECT p.post_id, h.slot_start
