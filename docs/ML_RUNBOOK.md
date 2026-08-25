@@ -23,14 +23,7 @@ PYTHONPATH="$PWD/src:$PWD/scripts" python scripts/train_spatial_paid_state.py \
   --neighbor-radius-m 250
 ```
 
-The tournament compares:
-
-1. persistence (`t+1 = latest observed state`)
-2. hour-conditioned climatology
-3. the existing 15-feature LightGBM
-4. the 31-feature spatial/dynamic LightGBM
-
-It reports overall MAE/RMSE plus availability bands, transition periods, daytime, and peak-evening performance.
+The tournament compares persistence, hour-conditioned climatology, the existing 15-feature LightGBM, and the 31-feature spatial/dynamic LightGBM. It reports overall MAE/RMSE plus availability bands, transition periods, daytime, and peak-evening performance.
 
 The spatial candidate is automatically promoted only when it beats both the current LightGBM and persistence overall **and** beats both on the transition regime with at least 100 transition observations. Otherwise the candidate remains isolated and production is unchanged. The process exits `3` when the promotion gate fails; that is an intentional scientific result, not a crash.
 
@@ -46,22 +39,26 @@ The spatial model is deliberately T+1 only. The established recursive model rema
 
 ## 4. Probability calibration
 
-After forecasts have matured:
+The tournament creates a validation-only spatial calibrator. After forecasts mature, the production calibration workflow can be run against matured forecasts:
 
 ```bash
 PYTHONPATH="$PWD/src" python scripts/fit_parking_probability_calibrator.py \
   --threshold 0.50
 ```
 
-Calibration estimates `P(actual availability >= 50%)` from matured held-out forecasts. Raw regression output is never described as a probability without calibration.
+Calibration estimates `P(actual availability >= 50%)`. Raw regression output is never described as a probability without calibration.
 
 ## 5. Decision engine
+
+For the spatial model, use its matching calibrator explicitly:
 
 ```bash
 PYTHONPATH="$PWD/src" python scripts/find_parking_intelligent.py \
   --lat 37.7972638 --lon -122.4334589 \
   --date 2026-08-24 --hour 18 \
-  --radius 250 --top 10
+  --radius 250 --top 10 \
+  --model-version spatial_dynamic_v1 \
+  --calibrator models/paid_state_spatial_probability_calibrator.json
 ```
 
 The finder ranks opportunities using forecast probability and distance, and reports a correlated neighborhood success estimate. It never silently jumps to a different forecast slot.
