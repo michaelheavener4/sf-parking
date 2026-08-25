@@ -2,7 +2,8 @@
 
 This is intentionally not a machine-learning tournament. It tests whether a
 simple arrival/departure hazard model can improve on one-hour persistence.
-All fitted rates are learned only from each fold's training window.
+All fitted rates are learned only from each fold's training window and all
+prediction features come from T-1 or earlier.
 """
 from __future__ import annotations
 
@@ -64,14 +65,10 @@ def make_folds(first: datetime, latest: datetime, train_days: int, validation_da
         train_start = train_end - timedelta(days=train_days - 1)
         if train_start < first_day:
             break
-        train_utc = local_window(train_start, train_end)
-        val_utc = local_window(val_start, val_end)
-        test_utc = local_window(test_start, end)
-        test_utc = (test_utc[0], min(test_utc[1], latest + timedelta(microseconds=1)))
         result.append({
-            "train": train_utc,
-            "validation": val_utc,
-            "test": test_utc,
+            "train": local_window(train_start, train_end),
+            "validation": local_window(val_start, val_end),
+            "test": local_window(test_start, end),
             "local_days": {
                 "train": [str(train_start), str(train_end)],
                 "validation": [str(val_start), str(val_end)],
@@ -79,7 +76,10 @@ def make_folds(first: datetime, latest: datetime, train_days: int, validation_da
             },
         })
         end -= timedelta(days=test_days)
-    return list(reversed(result))
+    result = list(reversed(result))
+    if result:
+        result[-1]["test"] = (result[-1]["test"][0], min(result[-1]["test"][1], latest + timedelta(microseconds=1)))
+    return result
 
 
 def learn_rates(conn, train_start: datetime, train_end: datetime) -> dict[str, object]:
@@ -100,7 +100,6 @@ def learn_rates(conn, train_start: datetime, train_end: datetime) -> dict[str, o
         for r in duration_rows
         if r[1] is not None and float(r[1]) > 0
     }
-
     hour_rows = conn.run("""
         SELECT EXTRACT(HOUR FROM (session_start AT TIME ZONE 'America/Los_Angeles'))::int AS h,
                EXTRACT(ISODOW FROM (session_start AT TIME ZONE 'America/Los_Angeles'))::int AS dow,
@@ -111,9 +110,12 @@ def learn_rates(conn, train_start: datetime, train_end: datetime) -> dict[str, o
         GROUP BY 1, 2
     """, start=train_start, end=train_end)
     days = max(1.0, (train_end - train_start).total_seconds() / 86400.0)
-    baseline = max(1e-9, sum(float(r[2]) for r in hour_rows) / (days * 168.0))
-    seasonality = {(int(r[0]), int(r[1])): max(0.05, float(r[2]) / max(days * baseline, 1e-9)) for r in hour_rows}
-
+    total_arrivals = sum(float(r[2]) for r in hour_rows)
+    baseline = max(1e-9, total_arrivals / (days * 168.0))
+    seasonality = {
+        (int(r[0]), int(r[1])): max(0.05, float(r[2]) / max(days * baseline, 1e-9))
+        for r in hour_rows
+    }
     global_duration = conn.run("""
         SELECT AVG(EXTRACT(EPOCH FROM (session_end - session_start)) / 3600.0)
         FROM meter_transactions
@@ -127,22 +129,34 @@ def learn_rates(conn, train_start: datetime, train_end: datetime) -> dict[str, o
 
 
 def sample_targets(conn, start: datetime, end: datetime, limit_rows: int, seed: int):
+    # Target contains y(T), but every predictor is explicitly from T-1.
     return conn.run("""
-        SELECT post_id, slot_start, paid_availability_probability, transaction_count, local_hour, local_date
-        FROM parking_state_hourly
-        WHERE slot_start >= :start AND slot_start < :end
-        ORDER BY hashtext(post_id || '|' || slot_start::text || :seed::text), post_id, slot_start
+        SELECT
+            t.post_id,
+            t.slot_start,
+            t.paid_availability_probability AS target_availability,
+            p.paid_availability_probability AS lag1_availability,
+            p.transaction_count AS lag1_transactions,
+            t.local_hour,
+            t.local_date
+        FROM parking_state_hourly t
+        JOIN parking_state_hourly p
+          ON p.post_id = t.post_id
+         AND p.slot_start = t.slot_start - INTERVAL '1 hour'
+        WHERE t.slot_start >= :start
+          AND t.slot_start < :end
+        ORDER BY hashtext(t.post_id || '|' || t.slot_start::text || :seed::text), t.post_id, t.slot_start
         LIMIT :limit_rows
     """, start=start, end=end, seed=str(seed), limit_rows=limit_rows)
 
 
-def predict(conn, targets, rates: dict[str, object], horizon_hours: float) -> pd.DataFrame:
+def predict(targets, rates: dict[str, object], horizon_hours: float) -> pd.DataFrame:
     rows = []
     post_rates = rates["post"]
     seasonality = rates["seasonality"]
     global_duration = float(rates["global_duration_h"])
     global_lambda = float(rates["baseline_hourly_rate"])
-    for post_id, slot, availability, tx1, hour, local_date in targets:
+    for post_id, slot, target, lag_availability, lag_tx1, hour, local_date in targets:
         params = post_rates.get(str(post_id))
         if params is None:
             duration_h = global_duration
@@ -151,40 +165,31 @@ def predict(conn, targets, rates: dict[str, object], horizon_hours: float) -> pd
             duration_h = 0.8 * float(params["mean_duration_h"]) + 0.2 * global_duration
             post_lambda = 0.8 * float(params["baseline_arrival_h"]) + 0.2 * global_lambda
         season = float(seasonality.get((int(hour), int(pd.Timestamp(local_date).isoweekday())), 1.0))
-        recent = max(0.0, float(tx1))
-        # Blend long-run post hazard, time-of-week hazard, and the most recent observed event rate.
+        recent = max(0.0, float(lag_tx1))
         lam = 0.55 * post_lambda * season + 0.45 * recent
-        pred = availability_forecast(float(availability), lam, duration_h, horizon_hours)
-        rows.append((str(post_id), slot, float(availability), float(pred), lam, duration_h, recent))
-    return pd.DataFrame(rows, columns=["post_id", "slot_start", "observed_availability", "predicted_availability", "arrival_rate_h", "duration_h", "recent_tx1"])
+        pred = availability_forecast(float(lag_availability), lam, duration_h, horizon_hours)
+        rows.append((str(post_id), slot, float(target), float(lag_availability), float(pred), lam, duration_h, recent))
+    return pd.DataFrame(rows, columns=["post_id", "slot_start", "target_availability", "lag1_availability", "predicted_availability", "arrival_rate_h", "duration_h", "recent_tx1"])
 
 
 def run_fold(conn, fold, args, idx):
     rates = learn_rates(conn, *fold["train"])
     targets = sample_targets(conn, *fold["test"], args.max_test_rows, 4000 + idx)
-    df = predict(conn, targets, rates, args.horizon_hours)
+    df = predict(targets, rates, args.horizon_hours)
     if df.empty:
         raise RuntimeError(f"fold {idx}: empty test sample")
-    y = df.observed_availability.to_numpy(float)
-    p = df.predicted_availability.to_numpy(float)
-    persist = df.observed_availability.to_numpy(float)
-    # Recover exact persistence baseline from the state table so the comparison is target T vs T-1h.
-    prev = conn.run("""
-        SELECT t.post_id, t.slot_start, p.paid_availability_probability
-        FROM (VALUES %s) AS t(post_id,slot_start)
-        LEFT JOIN parking_state_hourly p ON p.post_id=t.post_id AND p.slot_start=t.slot_start-INTERVAL '1 hour'
-    """ % ",".join("(%r,%r)" % (str(r[0]), r[1].isoformat()) for r in targets))
-    prev_map = {(str(r[0]), r[1]): r[2] for r in prev if r[2] is not None}
-    lag = np.array([float(prev_map[(str(r[0]), r[1])]) for r in targets if (str(r[0]), r[1]) in prev_map], float)
-    y2 = np.array([float(r[2]) for r in targets if (str(r[0]), r[1]) in prev_map], float)
-    p2 = np.array([float(df.loc[(df.post_id == str(r[0])) & (df.slot_start == r[1]), "predicted_availability"].iloc[0]) for r in targets if (str(r[0]), r[1]) in prev_map], float)
+    keep = np.isfinite(df["lag1_availability"].to_numpy(float)) & np.isfinite(df["target_availability"].to_numpy(float))
+    df = df.loc[keep].reset_index(drop=True)
+    y = df.target_availability.to_numpy(float)
+    lag = df.lag1_availability.to_numpy(float)
+    pred = df.predicted_availability.to_numpy(float)
     return {
         "fold": idx,
         "local_days": fold["local_days"],
-        "rows": int(len(y2)),
-        "dynamics": metric(y2, p2),
-        "persistence": metric(y2, lag),
-        "transitions": {str(t): transition_metrics(y2, lag, p2, t) for t in (0.05, 0.10, 0.25)},
+        "rows": int(len(df)),
+        "dynamics": metric(y, pred),
+        "persistence": metric(y, lag),
+        "transitions": {str(t): transition_metrics(y, lag, pred, t) for t in (0.05, 0.10, 0.25)},
         "mean_arrival_rate_h": float(df.arrival_rate_h.mean()),
         "mean_duration_h": float(df.duration_h.mean()),
     }
@@ -219,7 +224,7 @@ def main() -> int:
     result = {
         "version": 1,
         "model": "two_state_arrival_departure_hazard",
-        "ground_truth": "exact same-post T-1 hour; targets and training windows use UTC bounds derived from Pacific local days",
+        "ground_truth": "exact same-post T-1 hour; targets use y(T), predictors use only T-1 and training-window transaction history",
         "folds": reports,
         "aggregate": {"test_rows": int(sum(w)), "persistence_mae": pm, "dynamics_mae": dm, "improvement_over_persistence": (pm - dm) / pm if pm else None},
     }
