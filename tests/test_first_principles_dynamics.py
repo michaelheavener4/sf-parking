@@ -10,7 +10,8 @@ def test_zero_arrivals_drift_toward_occupied():
 
 def test_high_arrivals_drift_toward_occupied_equilibrium():
     p = two_state_forecast(0.0, 2.0, 1.0, 10.0)
-    assert p > 0.9
+    # Stationary occupancy is lambda / (lambda + mu) = 2 / 3 here.
+    assert 0.65 < p < 0.68
 
 
 def test_availability_is_complement_of_occupancy():
