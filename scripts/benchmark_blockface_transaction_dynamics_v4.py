@@ -1,9 +1,10 @@
 """Runnable V4 research runner for the causal blockface dynamics benchmark.
 
-V4 fixes three benchmark-harness issues:
+V4 fixes four benchmark-harness issues:
 - canonical text ID types at every SQL boundary;
 - direct execution from repo root;
-- partial latest local days are excluded from rolling-origin test folds.
+- partial latest local days are excluded from rolling-origin test folds;
+- the original fold generator is preserved before V4 overrides it.
 """
 from __future__ import annotations
 
@@ -20,6 +21,8 @@ if SPEC is None or SPEC.loader is None:
     raise RuntimeError("Unable to load V3 benchmark module")
 v3 = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(v3)
+
+ORIGINAL_FOLDS = v3.folds
 
 
 def normalized_mapping_sql() -> str:
@@ -76,21 +79,25 @@ def normalized_targets(conn, start, end, k, seed):
 
 
 def complete_day_folds(first, latest, train_days, test_days, max_folds):
-    """Use only the latest fully observed local day.
-
-    parking_state_hourly is hourly. A local day is considered complete when the
-    latest observed local slot is hour 23 or later. Otherwise, move back one
-    local day so the benchmark never treats an in-progress day as a test day.
-    """
+    """Use only complete local days, without recursively calling the override."""
     latest_local = latest.astimezone(v3.TZ)
     if latest_local.hour < 23:
         adjusted_latest = latest_local - timedelta(days=1)
     else:
         adjusted_latest = latest_local
-    result = v3.folds(first, adjusted_latest, train_days, test_days, max_folds)
-    skipped = latest_local.date() if adjusted_latest.date() != latest_local.date() else None
-    if skipped:
-        print(f"  excluding partial local day {skipped}; latest observed local hour={latest_local.hour:02d}")
+
+    result = ORIGINAL_FOLDS(first, adjusted_latest, train_days, test_days, max_folds)
+    if adjusted_latest.date() != latest_local.date():
+        print(
+            f"  excluding partial local day {latest_local.date()}; "
+            f"latest observed local hour={latest_local.hour:02d}"
+        )
+    if not result:
+        raise RuntimeError(
+            "No complete local-day folds available. "
+            f"first={first.astimezone(v3.TZ).date()}, "
+            f"latest_complete={adjusted_latest.astimezone(v3.TZ).date()}"
+        )
     return result
 
 
