@@ -1,12 +1,14 @@
-"""Runnable V4 wrapper for the causal blockface dynamics benchmark.
+"""Runnable V4 research runner for the causal blockface dynamics benchmark.
 
-Normalizes IDs at the SQL boundary and fixes the capacity CTE so blockface_id
-has one canonical text type throughout the target-building query. The module
-is loaded by file path so `python3 scripts/...` works directly from repo root.
+V4 fixes three benchmark-harness issues:
+- canonical text ID types at every SQL boundary;
+- direct execution from repo root;
+- partial latest local days are excluded from rolling-origin test folds.
 """
 from __future__ import annotations
 
 import importlib.util
+from datetime import timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -73,8 +75,28 @@ def normalized_targets(conn, start, end, k, seed):
     )
 
 
+def complete_day_folds(first, latest, train_days, test_days, max_folds):
+    """Use only the latest fully observed local day.
+
+    parking_state_hourly is hourly. A local day is considered complete when the
+    latest observed local slot is hour 23 or later. Otherwise, move back one
+    local day so the benchmark never treats an in-progress day as a test day.
+    """
+    latest_local = latest.astimezone(v3.TZ)
+    if latest_local.hour < 23:
+        adjusted_latest = latest_local - timedelta(days=1)
+    else:
+        adjusted_latest = latest_local
+    result = v3.folds(first, adjusted_latest, train_days, test_days, max_folds)
+    skipped = latest_local.date() if adjusted_latest.date() != latest_local.date() else None
+    if skipped:
+        print(f"  excluding partial local day {skipped}; latest observed local hour={latest_local.hour:02d}")
+    return result
+
+
 v3.mapping_sql = normalized_mapping_sql
 v3.targets = normalized_targets
+v3.folds = complete_day_folds
 
 
 if __name__ == "__main__":
