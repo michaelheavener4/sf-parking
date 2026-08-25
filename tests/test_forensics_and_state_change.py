@@ -1,7 +1,4 @@
-from datetime import date
-
 import numpy as np
-import pandas as pd
 
 from scripts.forensic_paid_state import quantiles
 from scripts.train_state_change import metric, transition
@@ -15,11 +12,11 @@ def test_quantiles_are_finite_and_monotonic():
 
 
 def test_transition_metrics_uses_actual_delta_threshold():
-    y = np.array([0.9, 0.7, 0.5, 0.8])
-    lag = np.array([0.8, 0.7, 0.6, 0.5])
-    pred = np.array([0.9, 0.8, 0.55, 0.6])
+    y = np.array([0.95, 0.70, 0.45, 0.80])
+    lag = np.array([0.80, 0.70, 0.60, 0.50])
+    pred = np.array([0.90, 0.80, 0.55, 0.60])
     r = transition(y, lag, pred, 0.10)
-    assert r["n"] == 2
+    assert r["n"] == 3
     assert 0 <= r["direction_accuracy"] <= 1
 
 
