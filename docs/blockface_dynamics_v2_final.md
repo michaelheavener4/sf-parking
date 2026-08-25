@@ -1,0 +1,1 @@
+V2 is the research-driven blockface transaction dynamics benchmark. The target is transaction-implied occupancy, not claimed physical ground truth. Persistence remains the champion baseline.
