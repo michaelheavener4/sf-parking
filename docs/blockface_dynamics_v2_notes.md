@@ -1,0 +1,1 @@
+V2 uses a blockface target reconstructed from raw paid sessions and mapped parking-space capacity. The one-hour forecast is driven by T-1 active sessions, training-only arrival intensity, and empirical conditional session survival. Exact persistence is retained as the control baseline.
