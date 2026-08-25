@@ -16,7 +16,6 @@ from sf_parking.calibration import fit_isotonic, save_calibrator
 from sf_parking.database import connect
 from sf_parking.ml_features import FEATURES_SPATIAL, SpatialFeatureConfig, build_spatial_features
 from benchmark_paid_state_lgbm import FEATURES as FEATURES_BASE
-from benchmark_paid_state_lgbm import build_features as build_base_features
 from benchmark_paid_state_lgbm import sample_day_targets
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +25,8 @@ MODEL_VERSION = "spatial_dynamic_v1"
 
 
 def scores(y: np.ndarray, p: np.ndarray) -> dict[str, float]:
+    if len(y) == 0:
+        return {"mae": float("nan"), "rmse": float("nan")}
     e = np.asarray(p, float) - np.asarray(y, float)
     return {"mae": float(np.mean(np.abs(e))), "rmse": float(np.sqrt(np.mean(e * e)))}
 
@@ -51,7 +52,7 @@ def evaluate(df: pd.DataFrame, pred: np.ndarray) -> dict:
     out = {"n": int(len(df)), "overall": scores(y, pred)}
     for name in ("0_30", "30_50", "50_70", "70_90", "90_100", "transition", "daytime", "peak_evening"):
         m = mask_for(df, name)
-        out[name] = {"n": int(m.sum()), **scores(y[m], pred[m])} if m.any() else {"n": 0}
+        out[name] = {"n": int(m.sum()), **scores(y[m], pred[m])} if m.any() else {"n": 0, "mae": float("nan"), "rmse": float("nan")}
     return out
 
 
@@ -80,14 +81,11 @@ def collect(conn, start, end, per_day, seed):
     return rows
 
 
-def features_in_batches(conn, targets, spatial, batch_size, config):
+def features_in_batches(conn, targets, batch_size, config):
     frames = []
     for start in range(0, len(targets), batch_size):
         chunk = targets[start:start + batch_size]
-        if spatial:
-            frame = build_spatial_features(conn, chunk, config=config)
-        else:
-            frame = build_base_features(conn, chunk, f"base {start + 1:,}-{min(start + batch_size, len(targets)):,}")
+        frame = build_spatial_features(conn, chunk, config=config)
         if not frame.empty:
             frames.append(frame)
         print(f"      features {min(start + batch_size, len(targets)):,}/{len(targets):,}", flush=True)
@@ -106,6 +104,27 @@ def save_model(model, path, meta):
     path.parent.mkdir(parents=True, exist_ok=True)
     model.booster_.save_model(str(path))
     path.with_suffix(".meta.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+
+
+def choose_windows(first, latest, requested_train, requested_val, requested_test):
+    first_day, latest_day = first.date(), latest.date()
+    available_days = (latest_day - first_day).days + 1
+    # We need at least one day of history for lag24 plus one day each for train/val/test.
+    if available_days < 4:
+        raise RuntimeError(
+            f"Only {available_days} calendar days of data exist ({first_day}..{latest_day}); "
+            "at least 4 are required for a chronological tournament."
+        )
+    test_days = min(requested_test, max(1, available_days // 4))
+    val_days = min(requested_val, max(1, available_days // 4))
+    train_days = min(requested_train, available_days - test_days - val_days)
+    if train_days < 1:
+        raise RuntimeError("Not enough history remains for a non-empty training window")
+    test_start = latest_day - timedelta(days=test_days - 1)
+    val_start = test_start - timedelta(days=val_days)
+    train_start = max(first_day, val_start - timedelta(days=train_days))
+    train_end = val_start - timedelta(days=1)
+    return train_start, train_end, val_start, test_start, latest_day, train_days, val_days, test_days
 
 
 def main() -> int:
@@ -128,79 +147,70 @@ def main() -> int:
         first, latest = conn.run("SELECT min(slot_start), max(slot_start) FROM parking_state_hourly WHERE slot_start <= NOW()")[0]
         if first is None or latest is None:
             raise RuntimeError("No completed hourly state exists")
-        test_start = latest - timedelta(days=args.test_days)
-        val_start = test_start - timedelta(days=args.validation_days)
-        train_start = max(first, val_start - timedelta(days=args.train_days))
-        train_end = val_start - timedelta(hours=1)
+        windows = choose_windows(first, latest, args.train_days, args.validation_days, args.test_days)
+        train_start, train_end, val_start, test_start, test_end, train_days, val_days, test_days = windows
+        requested = (args.train_days, args.validation_days, args.test_days)
+        actual = (train_days, val_days, test_days)
+        if actual != requested:
+            print(f"⚠️ Requested {requested[0]}/{requested[1]}/{requested[2]} days, but only {actual[0]}/{actual[1]}/{actual[2]} fit in available history.")
         print(f"Train      {train_start} → {train_end}")
-        print(f"Validation {val_start} → {test_start - timedelta(hours=1)}")
-        print(f"Test       {test_start} → {latest}")
+        print(f"Validation {val_start} → {test_start - timedelta(days=1)}")
+        print(f"Test       {test_start} → {test_end}")
 
-        nd_train = max(1, (train_end.date() - train_start.date()).days + 1)
-        nd_val = max(1, args.validation_days)
-        nd_test = max(1, args.test_days)
-        train_targets = collect(conn, train_start.date(), train_end.date(), math.ceil(args.max_train_rows / nd_train), 42)[:args.max_train_rows]
-        val_targets = collect(conn, val_start.date(), (test_start - timedelta(days=1)).date(), math.ceil(args.max_validation_rows / nd_val), 43)[:args.max_validation_rows]
-        test_targets = collect(conn, test_start.date(), latest.date(), math.ceil(args.max_test_rows / nd_test), 44)[:args.max_test_rows]
+        train_targets = collect(conn, train_start, train_end, math.ceil(args.max_train_rows / train_days), 42)[:args.max_train_rows]
+        val_targets = collect(conn, val_start, test_start - timedelta(days=1), math.ceil(args.max_validation_rows / val_days), 43)[:args.max_validation_rows]
+        test_targets = collect(conn, test_start, test_end, math.ceil(args.max_test_rows / test_days), 44)[:args.max_test_rows]
         print(f"Targets train={len(train_targets):,} val={len(val_targets):,} test={len(test_targets):,}")
+        if min(len(train_targets), len(val_targets), len(test_targets)) == 0:
+            raise RuntimeError("A chronological split contains no target rows")
 
-        print("\n[1/4] Baseline feature matrices")
-        train_b = features_in_batches(conn, train_targets, False, args.feature_batch_size, cfg)
-        val_b = features_in_batches(conn, val_targets, False, args.feature_batch_size, cfg)
-        test_b = features_in_batches(conn, test_targets, False, args.feature_batch_size, cfg)
-        if min(len(train_b), len(val_b), len(test_b)) == 0:
-            raise RuntimeError("A chronological split has no complete lag history")
-
-        print("\n[2/4] Spatial/dynamic feature matrices")
-        train_s = features_in_batches(conn, train_targets, True, args.feature_batch_size, cfg)
-        val_s = features_in_batches(conn, val_targets, True, args.feature_batch_size, cfg)
-        test_s = features_in_batches(conn, test_targets, True, args.feature_batch_size, cfg)
+        print("\n[1/4] Building leakage-safe temporal + spatial feature matrices")
+        train_s = features_in_batches(conn, train_targets, args.feature_batch_size, cfg)
+        val_s = features_in_batches(conn, val_targets, args.feature_batch_size, cfg)
+        test_s = features_in_batches(conn, test_targets, args.feature_batch_size, cfg)
         if min(len(train_s), len(val_s), len(test_s)) == 0:
-            raise RuntimeError("Spatial feature construction returned an empty split")
+            raise RuntimeError("Feature construction returned an empty chronological split")
 
-        print("\n[3/4] Training and scoring")
+        # The baseline is deliberately derived from the same point-in-time rows as the spatial model.
+        # This guarantees identical target populations and prevents a data-selection advantage.
+        train_b, val_b, test_b = (x[["post_id", "slot_start", "target", *FEATURES_BASE]].copy() for x in (train_s, val_s, test_s))
+
+        print("\n[2/4] Training baseline and spatial models")
         base_model = train_lgbm(train_b, val_b, FEATURES_BASE)
         spatial_model = train_lgbm(train_s, val_s, FEATURES_SPATIAL)
+
+        print("\n[3/4] Scoring tournament")
         base_pred = np.clip(base_model.predict(test_b[FEATURES_BASE]), 0, 1)
         spatial_pred = np.clip(spatial_model.predict(test_s[FEATURES_SPATIAL]), 0, 1)
         persistence = test_b.lag1_availability.to_numpy(float)
         clim = climatology(train_b, test_b)
-
-        # Both builders use the same target keys. Reindex spatial predictions to base order.
-        idx = test_s[["post_id", "slot_start"]].copy()
-        idx["i"] = np.arange(len(idx))
-        order = test_b[["post_id", "slot_start"]].merge(idx, on=["post_id", "slot_start"], how="left", sort=False)["i"]
-        if order.isna().any() or len(order) != len(test_b):
-            raise RuntimeError("Baseline/spatial test alignment failed")
-        spatial_pred = spatial_pred[order.to_numpy(int)]
-
         results = {
             "persistence": evaluate(test_b, persistence),
             "hour_climatology": evaluate(test_b, clim),
             "current_lgbm": evaluate(test_b, base_pred),
-            "spatial_dynamic_lgbm": evaluate(test_b, spatial_pred),
+            "spatial_dynamic_lgbm": evaluate(test_s, spatial_pred),
         }
         for name, r in results.items():
             print(f"\n{name}: MAE={r['overall']['mae']:.6f} RMSE={r['overall']['rmse']:.6f} n={r['n']:,}")
-            for regime in ("0_30", "30_50", "50_70", "transition", "peak_evening"):
+            for regime in ("0_30", "30_50", "50_70", "70_90", "transition", "peak_evening"):
                 q = r[regime]
                 if q["n"]: print(f"  {regime:16s} n={q['n']:,} MAE={q['mae']:.6f}")
 
-        s = results["spatial_dynamic_lgbm"]; b = results["current_lgbm"]; p = results["persistence"]
+        s, b, p = results["spatial_dynamic_lgbm"], results["current_lgbm"], results["persistence"]
         overall_gate = s["overall"]["mae"] < b["overall"]["mae"] and s["overall"]["mae"] < p["overall"]["mae"]
         transition_gate = s["transition"]["n"] >= 100 and s["transition"]["mae"] < b["transition"]["mae"] and s["transition"]["mae"] < p["transition"]["mae"]
         promoted = overall_gate and transition_gate
 
         print("\n[4/4] Artifacts and promotion")
+        MODELS.mkdir(parents=True, exist_ok=True)
         candidate = MODELS / "paid_state_spatial_candidate_lgbm.txt"
         meta = {
             "model_version": MODEL_VERSION, "features": FEATURES_SPATIAL,
             "neighbor_k": args.neighbor_k, "neighbor_radius_m": args.neighbor_radius_m,
             "train_rows": len(train_s), "validation_rows": len(val_s), "test_rows": len(test_s),
-            "train_window": [str(train_start), str(train_end)],
-            "validation_window": [str(val_start), str(test_start - timedelta(hours=1))],
-            "test_window": [str(test_start), str(latest)],
+            "train_window": [str(train_start), str(train_end)], "validation_window": [str(val_start), str(test_start - timedelta(days=1))], "test_window": [str(test_start), str(test_end)],
             "metrics": s, "promotion": {"overall": overall_gate, "transition": transition_gate, "promoted": promoted},
+            "lag168_note": "When historical coverage is shorter than 168 hours, lag168 falls back to lag24; this is explicit bootstrap behavior, not future leakage.",
         }
         save_model(spatial_model, candidate, meta)
         if promoted:
@@ -210,27 +220,22 @@ def main() -> int:
         else:
             print("🛑 Candidate retained; production spatial model not changed")
 
-        # Calibration is trained on validation predictions, never on test labels.
         val_pred = np.clip(spatial_model.predict(val_s[FEATURES_SPATIAL]), 0, 1)
         events = (val_s.target.to_numpy(float) >= .50).astype(float)
-        save_calibrator(
-            fit_isotonic(val_pred, events),
-            MODELS / "paid_state_spatial_probability_calibrator.json",
-            event="actual_availability >= 0.500",
-            training_window=(str(val_start), str(test_start - timedelta(hours=1))),
-        )
+        save_calibrator(fit_isotonic(val_pred, events), MODELS / "paid_state_spatial_probability_calibrator.json", event="actual_availability >= 0.500", training_window=(str(val_start), str(test_start - timedelta(days=1))))
         importance = sorted(zip(FEATURES_SPATIAL, spatial_model.booster_.feature_importance("gain")), key=lambda x: x[1], reverse=True)
         report = {
             "generated_at": datetime.now(timezone.utc).isoformat(), "model_version": MODEL_VERSION,
             "rows": {"train": len(train_s), "validation": len(val_s), "test": len(test_s)},
-            "windows": {"train": [str(train_start), str(train_end)], "validation": [str(val_start), str(test_start - timedelta(hours=1))], "test": [str(test_start), str(latest)]},
+            "windows": {"train": [str(train_start), str(train_end)], "validation": [str(val_start), str(test_start - timedelta(days=1))], "test": [str(test_start), str(test_end)]},
+            "requested_days": {"train": args.train_days, "validation": args.validation_days, "test": args.test_days},
+            "actual_days": {"train": train_days, "validation": val_days, "test": test_days},
             "results": results, "promotion": {"overall": overall_gate, "transition": transition_gate, "promoted": promoted},
             "feature_importance_gain": [{"feature": k, "gain": float(v)} for k, v in importance],
             "elapsed_seconds": round(time.monotonic() - t0, 2),
         }
-        (MODELS / "paid_state_spatial_tournament.json").parent.mkdir(parents=True, exist_ok=True)
         (MODELS / "paid_state_spatial_tournament.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-        print(f"Report: models/paid_state_spatial_tournament.json")
+        print("Report: models/paid_state_spatial_tournament.json")
         print(f"Runtime: {time.monotonic() - t0:.1f}s")
         return 0 if promoted else 3
     finally:
