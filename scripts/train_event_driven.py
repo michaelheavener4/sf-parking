@@ -1,9 +1,4 @@
-"""Event-driven parking state transition tournament.
-
-Three-stage model: detect a meaningful change, predict direction, then predict
-conditional magnitude. Training may enrich rare events; validation/test remain
-chronological and unbiased. All model features are strictly pre-target.
-"""
+"""Event-driven parking state transition tournament."""
 from __future__ import annotations
 import argparse, json, math
 from datetime import date, timedelta
@@ -12,12 +7,6 @@ import numpy as np
 import pandas as pd
 from sf_parking.database import connect
 from sf_parking.ml_features import FEATURES_SPATIAL, SpatialFeatureConfig, build_spatial_features
-
-try:
-    from scripts.benchmark_paid_state_lgbm import sample_day_targets
-except ModuleNotFoundError as exc:
-    if exc.name != "scripts": raise
-    from benchmark_paid_state_lgbm import sample_day_targets
 
 ROOT=Path(__file__).resolve().parents[1]
 OUT=ROOT/"models"/"paid_state_event_tournament.json"
@@ -50,7 +39,6 @@ def average_precision(y,score):
     return float(np.sum((recall[1:]-recall[:-1])*precision[1:])+precision[0]*recall[0])
 
 def prior_correct_probability(p,sample_prior,natural_prior):
-    """Undo the prior shift caused by deliberately oversampling rare events."""
     p=np.clip(np.asarray(p,float),1e-9,1-1e-9)
     if sample_prior<=0 or sample_prior>=1 or natural_prior<=0 or natural_prior>=1: return p
     odds=p/(1-p); sample_odds=sample_prior/(1-sample_prior); natural_odds=natural_prior/(1-natural_prior)
@@ -68,10 +56,20 @@ def choose_windows(first,latest,train_days,val_days,test_days):
     test_start=last_day-timedelta(days=td-1); val_start=test_start-timedelta(days=vd); train_start=max(first_day,val_start-timedelta(days=tr))
     return train_start,val_start,test_start,last_day
 
+def sample_day_targets_unbiased(conn,day:date,limit_rows:int,seed:int):
+    bucket=max(1,min(999,int((limit_rows/350_000)*1000)))
+    sql="""SELECT post_id,slot_start,paid_availability_probability,meter_type,local_hour,local_date
+      FROM parking_state_hourly
+      WHERE local_date=:day
+        AND mod(abs(hashtext(post_id||'|'||slot_start::text||:seed::text)),1000)<:bucket
+      ORDER BY hashtext(post_id||'|'||slot_start::text||:seed::text),post_id,slot_start
+      LIMIT :limit_rows"""
+    return conn.run(sql,day=day,seed=str(seed),bucket=bucket,limit_rows=limit_rows)
+
 def collect_background(conn,start:date,end:date,per_day:int,seed:int,cap:int):
     rows=[]; day=start
     while day<=end and len(rows)<cap:
-        part=sample_day_targets(conn,day,per_day,seed); rows.extend(part); print(f"  background {day}: +{len(part):,}; total={len(rows):,}",flush=True); day+=timedelta(days=1)
+        part=sample_day_targets_unbiased(conn,day,per_day,seed); rows.extend(part); print(f"  background {day}: +{len(part):,}; total={len(rows):,}",flush=True); day+=timedelta(days=1)
     return rows[:cap]
 
 def collect_events(conn,start:date,end:date,per_day:int,seed:int,threshold:float,cap:int):
@@ -84,39 +82,24 @@ def collect_events(conn,start:date,end:date,per_day:int,seed:int,threshold:float
         part=conn.run(sql,day=day,threshold=threshold,seed=str(seed),limit_rows=per_day); rows.extend(part); print(f"  enriched   {day}: +{len(part):,}; total={len(rows):,}",flush=True); day+=timedelta(days=1)
     return rows[:cap]
 
-def sampled_raw_transition_summary(conn, day: date, limit_rows: int, seed: int, threshold: float) -> dict:
-    """Audit the exact rows selected by sample_day_targets before feature construction."""
-    bucket=max(1,min(999,int((limit_rows/350_000)*1000)))
-    row=conn.run("""
-      WITH sampled AS (
-        SELECT s.post_id,s.slot_start,s.paid_availability_probability y,p.paid_availability_probability prev_y
-        FROM parking_state_hourly s
-        JOIN parking_state_hourly p ON p.post_id=s.post_id AND p.slot_start=s.slot_start-INTERVAL '1 hour'
-        WHERE s.local_date=:day
-          AND mod(abs(hashtext(s.post_id||'|'||s.slot_start::text||:seed::text)),1000)<:bucket
-        ORDER BY s.slot_start,s.post_id
-        LIMIT :limit_rows
-      )
-      SELECT count(*),
-             count(*) FILTER (WHERE abs(y-prev_y)>=:threshold),
-             avg(abs(y-prev_y)),
-             avg((abs(y-prev_y)=0)::int)
-      FROM sampled
-    """,day=day,seed=str(seed),bucket=bucket,limit_rows=limit_rows,threshold=threshold)[0]
-    return {
-        "bucket": int(bucket),
-        "rows_with_exact_prev": int(row[0]),
-        "events": int(row[1]),
-        "event_rate": float(row[1]/row[0]) if row[0] else None,
-        "mean_abs_delta": float(row[2]) if row[2] is not None else None,
-        "unchanged_rate": float(row[3]) if row[3] is not None else None,
-    }
+def audit_targets(conn,targets,threshold):
+    if not targets:return {"rows":0,"rows_with_exact_prev":0,"events":0,"event_rate":None,"unchanged_rate":None,"mean_abs_delta":None}
+    conn.run("DROP TABLE IF EXISTS _event_target_audit")
+    conn.run("CREATE TEMP TABLE _event_target_audit (post_id text,slot_start timestamptz,target double precision,meter_type text,local_hour int,local_date date)")
+    import csv
+    from io import StringIO
+    buf=StringIO(); csv.writer(buf,lineterminator="\n").writerows(targets)
+    conn.run("COPY _event_target_audit (post_id,slot_start,target,meter_type,local_hour,local_date) FROM STDIN WITH (FORMAT csv)",stream=[buf.getvalue().encode()])
+    row=conn.run("""SELECT count(*),count(p.paid_availability_probability),count(*) FILTER(WHERE p.paid_availability_probability IS NOT NULL AND abs(t.target-p.paid_availability_probability)>=:threshold),avg(abs(t.target-p.paid_availability_probability)) FILTER(WHERE p.paid_availability_probability IS NOT NULL),avg((t.target=p.paid_availability_probability)::int) FILTER(WHERE p.paid_availability_probability IS NOT NULL) FROM _event_target_audit t LEFT JOIN parking_state_hourly p ON p.post_id=t.post_id AND p.slot_start=t.slot_start-INTERVAL '1 hour'""",threshold=threshold)[0]
+    conn.run("DROP TABLE IF EXISTS _event_target_audit")
+    n,exact,events,mean_abs,unchanged=row
+    return {"rows":int(n),"rows_with_exact_prev":int(exact),"events":int(events),"event_rate":float(events/exact) if exact else None,"mean_abs_delta":float(mean_abs) if mean_abs is not None else None,"unchanged_rate":float(unchanged) if unchanged is not None else None}
 
 def features(conn,targets,cfg,batch):
     frames=[]
     for i in range(0,len(targets),batch):
         f=build_spatial_features(conn,targets[i:i+batch],config=cfg)
-        if not f.empty: frames.append(f)
+        if not f.empty:frames.append(f)
         print(f"  features {min(i+batch,len(targets)):,}/{len(targets):,}",flush=True)
     return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
 
@@ -126,49 +109,47 @@ def fit_models(train,val,threshold):
     yt=(np.abs(train.delta)>=threshold).astype(int); yv=(np.abs(val.delta)>=threshold).astype(int)
     event=lgb.LGBMClassifier(objective="binary",**common); event.fit(train[FEATURES_SPATIAL],yt,eval_X=val[FEATURES_SPATIAL],eval_y=yv,callbacks=[lgb.early_stopping(75,verbose=False)])
     te,ve=train[yt==1],val[yv==1]
-    if len(te)==0 or len(ve)==0: raise RuntimeError("No transition examples available for conditional models")
+    if len(te)==0 or len(ve)==0:raise RuntimeError("No transition examples available for conditional models")
     direction=lgb.LGBMClassifier(objective="binary",**common); direction.fit(te[FEATURES_SPATIAL],(te.delta>0).astype(int),eval_X=ve[FEATURES_SPATIAL],eval_y=(ve.delta>0).astype(int),callbacks=[lgb.early_stopping(75,verbose=False)])
     magnitude=lgb.LGBMRegressor(objective="regression",**common); magnitude.fit(te[FEATURES_SPATIAL],np.abs(te.delta),eval_X=ve[FEATURES_SPATIAL],eval_y=np.abs(ve.delta),callbacks=[lgb.early_stopping(75,verbose=False)])
     return event,direction,magnitude
 
 def main():
     ap=argparse.ArgumentParser()
-    for name,default in (("train-days",90),("validation-days",7),("test-days",7),("max-train-rows",250000),("max-validation-rows",100000),("max-test-rows",150000),("neighbor-k",24),("feature-batch-size",10000)): ap.add_argument("--"+name,type=int,default=default)
-    ap.add_argument("--neighbor-radius-m",type=float,default=250); ap.add_argument("--transition-threshold",type=float,default=.10); ap.add_argument("--event-enrichment",type=int,default=50000); args=ap.parse_args()
-    print("🚦 SF PARKING — EVENT-DRIVEN STATE TRANSITION TOURNAMENT"); conn=connect()
+    for name,default in (("train-days",90),("validation-days",7),("test-days",7),("max-train-rows",250000),("max-validation-rows",100000),("max-test-rows",150000),("neighbor-k",24),("feature-batch-size",10000)):ap.add_argument("--"+name,type=int,default=default)
+    ap.add_argument("--neighbor-radius-m",type=float,default=250);ap.add_argument("--transition-threshold",type=float,default=.10);ap.add_argument("--event-enrichment",type=int,default=50000);args=ap.parse_args()
+    print("🚦 SF PARKING — EVENT-DRIVEN STATE TRANSITION TOURNAMENT");conn=connect()
     try:
         first,latest=conn.run("SELECT min(slot_start),max(slot_start) FROM parking_state_hourly WHERE slot_start<=NOW()")[0]
-        tr0,v0,t0,t1=choose_windows(first,latest,args.train_days,args.validation_days,args.test_days); print(f"Train {tr0} → {v0-timedelta(days=1)}; Validation {v0} → {t0-timedelta(days=1)}; Test {t0} → {t1}")
-        tr_days,va_days,te_days=max(1,(v0-tr0).days),max(1,(t0-v0).days),max(1,(t1-t0).days+1); bg=min(50000,max(1000,math.ceil(args.max_train_rows/tr_days))); ev=max(500,math.ceil(args.event_enrichment/tr_days))
+        tr0,v0,t0,t1=choose_windows(first,latest,args.train_days,args.validation_days,args.test_days);print(f"Train {tr0} → {v0-timedelta(days=1)}; Validation {v0} → {t0-timedelta(days=1)}; Test {t0} → {t1}")
+        tr_days,va_days,te_days=max(1,(v0-tr0).days),max(1,(t0-v0).days),max(1,(t1-t0).days+1);bg=min(50000,max(1000,math.ceil(args.max_train_rows/tr_days)));ev=max(500,math.ceil(args.event_enrichment/tr_days))
         print("[1/4] Chronological samples")
-        background=collect_background(conn,tr0,v0-timedelta(days=1),bg,61,args.max_train_rows); enriched=collect_events(conn,tr0,v0-timedelta(days=1),ev,62,args.transition_threshold,args.event_enrichment)
-        seen={(r[0],r[1]) for r in background}; enriched=[r for r in enriched if (r[0],r[1]) not in seen]; train_targets=background+enriched
-        val_targets=collect_background(conn,v0,t0-timedelta(days=1),max(1000,math.ceil(args.max_validation_rows/va_days)),63,args.max_validation_rows); test_targets=collect_background(conn,t0,t1,max(1000,math.ceil(args.max_test_rows/te_days)),64,args.max_test_rows)
+        background=collect_background(conn,tr0,v0-timedelta(days=1),bg,61,args.max_train_rows);enriched=collect_events(conn,tr0,v0-timedelta(days=1),ev,62,args.transition_threshold,args.event_enrichment)
+        seen={(r[0],r[1]) for r in background};enriched=[r for r in enriched if (r[0],r[1]) not in seen];train_targets=background+enriched
+        val_targets=collect_background(conn,v0,t0-timedelta(days=1),max(1000,math.ceil(args.max_validation_rows/va_days)),63,args.max_validation_rows);test_targets=collect_background(conn,t0,t1,max(1000,math.ceil(args.max_test_rows/te_days)),64,args.max_test_rows)
+        test_audit=audit_targets(conn,test_targets,args.transition_threshold)
+        print(f"  raw sampled test transition audit: {json.dumps(test_audit,sort_keys=True)}")
         print(f"Training={len(train_targets):,} (enriched events={len(enriched):,}); validation={len(val_targets):,}; test={len(test_targets):,}")
-        test_days_seen=sorted({r[5] for r in test_targets})
-        raw_test_summary={str(day):sampled_raw_transition_summary(conn,day, min(350_000,args.max_test_rows),64,args.transition_threshold) for day in test_days_seen}
-        print("raw sampled test transition audit:",json.dumps(raw_test_summary,sort_keys=True))
-        cfg=SpatialFeatureConfig(args.neighbor_k,args.neighbor_radius_m); print("[2/4] Leakage-safe features")
-        train=features(conn,train_targets,cfg,args.feature_batch_size); val=features(conn,val_targets,cfg,args.feature_batch_size); test=features(conn,test_targets,cfg,args.feature_batch_size)
-    finally: conn.close()
-    for df in (train,val,test): df["delta"]=df.target-df.lag1_availability
-    feature_test_summary={"rows":int(len(test)),"events":int(np.sum(np.abs(test.delta)>=args.transition_threshold)) if len(test) else 0,"event_rate":float(np.mean(np.abs(test.delta)>=args.transition_threshold)) if len(test) else None,"mean_abs_delta":float(np.mean(np.abs(test.delta))) if len(test) else None,"unchanged_rate":float(np.mean(np.abs(test.delta)==0)) if len(test) else None}
-    print("feature-materialized test transition audit:",json.dumps(feature_test_summary,sort_keys=True))
+        cfg=SpatialFeatureConfig(args.neighbor_k,args.neighbor_radius_m);print("[2/4] Leakage-safe features")
+        train=features(conn,train_targets,cfg,args.feature_batch_size);val=features(conn,val_targets,cfg,args.feature_batch_size);test=features(conn,test_targets,cfg,args.feature_batch_size)
+    finally:conn.close()
+    for df in (train,val,test):df["delta"]=df.target-df.lag1_availability
+    feature_delta=np.abs(test.delta.to_numpy(float)) if len(test) else np.array([])
+    feature_audit={"rows":int(len(test)),"events":int(np.sum(feature_delta>=args.transition_threshold-1e-12)),"event_rate":float(np.mean(feature_delta>=args.transition_threshold-1e-12)) if len(test) else None,"unchanged_rate":float(np.mean(feature_delta<1e-12)) if len(test) else None,"mean_abs_delta":float(np.mean(feature_delta)) if len(test) else None}
+    print(f"feature-materialized test transition audit: {json.dumps(feature_audit,sort_keys=True)}")
     print("[3/4] Training event detector + direction + magnitude")
     event,direction,magnitude=fit_models(train,val,args.transition_threshold)
-    x=test[FEATURES_SPATIAL]; lag=test.lag1_availability.to_numpy(float); y=test.target.to_numpy(float); actual=y-lag; event_y=(np.abs(actual)>=args.transition_threshold).astype(int)
-    raw_event=event.predict_proba(x)[:,1]
-    sample_prior=float(np.mean(np.abs(train.delta)>=args.transition_threshold)); natural_prior=float(np.mean(np.abs(val.delta)>=args.transition_threshold))
-    p_event=prior_correct_probability(raw_event,sample_prior,natural_prior)
-    p_up=direction.predict_proba(x)[:,1]; mag=np.maximum(0,magnitude.predict(x)); expected_delta=p_event*(2*p_up-1)*mag; state=np.clip(lag+expected_delta,0,1)
+    x=test[FEATURES_SPATIAL];lag=test.lag1_availability.to_numpy(float);y=test.target.to_numpy(float);actual=y-lag;event_y=(np.abs(actual)>=args.transition_threshold).astype(int)
+    raw_event=event.predict_proba(x)[:,1];sample_prior=float(np.mean(np.abs(train.delta)>=args.transition_threshold));natural_prior=float(np.mean(np.abs(val.delta)>=args.transition_threshold));p_event=prior_correct_probability(raw_event,sample_prior,natural_prior)
+    p_up=direction.predict_proba(x)[:,1];mag=np.maximum(0,magnitude.predict(x));expected_delta=p_event*(2*p_up-1)*mag;state=np.clip(lag+expected_delta,0,1)
     print("[4/4] Results")
-    er=binary_metrics(event_y,p_event); er["roc_auc"]=rank_auc(event_y,p_event); er["pr_auc"]=average_precision(event_y,p_event); er["raw_training_event_rate"]=sample_prior; er["calibration_target_event_rate"]=natural_prior
-    print("event_detector:",json.dumps(er,sort_keys=True)); em=event_y==1; da=float(np.mean((actual[em]>0)==(p_up[em]>=.5))) if em.any() else None
-    print(f"direction_on_actual_events: {da}"); print("persistence:",json.dumps(metric(y,lag))); print("event_driven_expected_state:",json.dumps(metric(y,state)))
+    er=binary_metrics(event_y,p_event);er["roc_auc"]=rank_auc(event_y,p_event);er["pr_auc"]=average_precision(event_y,p_event);er["raw_training_event_rate"]=sample_prior;er["calibration_target_event_rate"]=natural_prior
+    print("event_detector:",json.dumps(er,sort_keys=True));em=event_y==1;da=float(np.mean((actual[em]>0)==(p_up[em]>=.5))) if em.any() else None
+    print(f"direction_on_actual_events: {da}");print("persistence:",json.dumps(metric(y,lag)));print("event_driven_expected_state:",json.dumps(metric(y,state)))
     transitions={str(t):transition_metrics(y,lag,state,t) for t in (.05,.10,.15,.25)}
-    for t,r in transitions.items(): print(f"|Δ|>={t}: {r}")
+    for t,r in transitions.items():print(f"|Δ|>={t}: {r}")
     sm,pm=metric(y,state),metric(y,lag)
-    report={"version":2,"model":"event_direction_magnitude_v1","transition_threshold":args.transition_threshold,"windows":{"train":[str(tr0),str(v0-timedelta(days=1))],"validation":[str(v0),str(t0-timedelta(days=1))],"test":[str(t0),str(t1)]},"rows":{"train":len(train),"validation":len(val),"test":len(test),"enriched_training_events":len(enriched)},"raw_sample_test_transition_audit":raw_test_summary,"feature_test_transition_audit":feature_test_summary,"event_detector":er,"direction_accuracy_on_actual_events":da,"persistence":pm,"event_driven_expected_state":sm,"transitions":transitions,"feature_count":len(FEATURES_SPATIAL),"promotion":"candidate" if sm["mae"]<pm["mae"] else "retained_only"}
-    OUT.parent.mkdir(parents=True,exist_ok=True); OUT.write_text(json.dumps(report,indent=2,default=str)); print(f"Report: {OUT}"); return 0
+    report={"version":2,"model":"event_direction_magnitude_v1","transition_threshold":args.transition_threshold,"windows":{"train":[str(tr0),str(v0-timedelta(days=1))],"validation":[str(v0),str(t0-timedelta(days=1))],"test":[str(t0),str(t1)]},"rows":{"train":len(train),"validation":len(val),"test":len(test),"enriched_training_events":len(enriched)},"raw_sample_audit":test_audit,"feature_materialized_audit":feature_audit,"event_detector":er,"direction_accuracy_on_actual_events":da,"persistence":pm,"event_driven_expected_state":sm,"transitions":transitions,"feature_count":len(FEATURES_SPATIAL),"promotion":"candidate" if sm["mae"]<pm["mae"] else "retained_only"}
+    OUT.parent.mkdir(parents=True,exist_ok=True);OUT.write_text(json.dumps(report,indent=2,default=str));print(f"Report: {OUT}");return 0
 
-if __name__=="__main__": raise SystemExit(main())
+if __name__=="__main__":raise SystemExit(main())
