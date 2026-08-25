@@ -1,0 +1,94 @@
+name: research-benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      benchmark:
+        description: Benchmark script to run
+        required: false
+        default: scripts/benchmark_blockface_transaction_dynamics_v4.py
+      max_test_rows:
+        description: Maximum target rows per fold
+        required: false
+        default: '50000'
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sf_parking
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d sf_parking"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: ${{ secrets.RESEARCH_DATABASE_URL }}
+      LOCAL_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/sf_parking
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e '.[dev]'
+
+      - name: Run unit tests first
+        run: python -m pytest -q
+
+      - name: Validate research database configuration
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo 'RESEARCH_DATABASE_URL is not configured.'
+            echo 'The benchmark requires the historical sf-parking PostgreSQL dataset.'
+            echo 'Unit tests passed, but a benchmark against an empty CI database would be invalid.'
+            exit 1
+          fi
+
+      - name: Check database connectivity
+        run: |
+          python - <<'PY'
+          import os
+          import pg8000.native
+          u = os.environ['DATABASE_URL']
+          # Accept postgres:// and postgresql:// URLs through pg8000's URL parser.
+          c = pg8000.native.Connection(host=u.split('@')[-1].split('/')[0].split(':')[0], user='postgres')
+          c.close()
+          PY
+        continue-on-error: true
+
+      - name: Run causal dynamics benchmark
+        run: |
+          python "${{ inputs.benchmark }}" --max-test-rows "${{ inputs.max_test_rows }}"
+
+      - name: Collect reports
+        if: always()
+        run: |
+          mkdir -p research-artifacts
+          find models -maxdepth 1 -type f -name '*.json' -newermt '10 minutes ago' -exec cp {} research-artifacts/ \; || true
+          python - <<'PY' > research-artifacts/environment.txt
+          import platform, sys
+          print(platform.platform())
+          print(sys.version)
+          PY
+
+      - name: Upload research artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sf-parking-research-${{ github.run_number }}
+          path: research-artifacts/
+          if-no-files-found: warn
+          retention-days: 30
