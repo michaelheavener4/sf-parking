@@ -7,7 +7,16 @@ import numpy as np
 import pandas as pd
 from sf_parking.database import connect
 from sf_parking.ml_features import FEATURES_SPATIAL, SpatialFeatureConfig, build_spatial_features
-from scripts.benchmark_paid_state_lgbm import sample_day_targets
+
+# Support both `python -m scripts.train_state_change` and the normal
+# executable form `python scripts/train_state_change.py`.
+try:
+    from scripts.benchmark_paid_state_lgbm import sample_day_targets
+except ModuleNotFoundError as exc:
+    if exc.name != "scripts":
+        raise
+    from benchmark_paid_state_lgbm import sample_day_targets
+
 ROOT=Path(__file__).resolve().parents[1]; OUT=ROOT/"models"/"paid_state_change_tournament.json"
 def collect(conn,start,end,per_day,seed):
  rows=[]; d=start
