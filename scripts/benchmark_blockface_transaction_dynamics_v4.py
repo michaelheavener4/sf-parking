@@ -1,14 +1,15 @@
 """Runnable V4 research runner for the causal blockface dynamics benchmark.
 
-V4 fixes four benchmark-harness issues:
+V4 fixes benchmark-harness issues:
 - canonical text ID types at every SQL boundary;
 - direct execution from repo root;
 - partial latest local days are excluded from rolling-origin test folds;
-- the original fold generator is preserved before V4 overrides it.
+- the original fold generator is preserved before V4 overrides it;
+- blockface identity and capacity use the same canonical parking_meters relation.
 
-Capacity and blockface identity come from the same parking_meters relation so
-we do not assume parking_spaces.blockface_id uses the identical identifier
-namespace.
+Capacity uses distinct parking_space_id when populated; otherwise each distinct
+mapped post_id contributes one capacity unit. This matches the actual source
+grain instead of assuming parking_space_id is populated.
 """
 from __future__ import annotations
 
@@ -43,10 +44,10 @@ def normalized_targets(conn, start, end, k, seed):
         f"""
         WITH mapping AS ({normalized_mapping_sql()}), capacity AS (
             SELECT blockface_id::text AS blockface_id,
-                   COUNT(DISTINCT parking_space_id)::int AS capacity
+                   COUNT(DISTINCT COALESCE(parking_space_id::text, post_id::text))::int AS capacity
             FROM parking_meters
             WHERE blockface_id IS NOT NULL
-              AND parking_space_id IS NOT NULL
+              AND post_id IS NOT NULL
             GROUP BY blockface_id
         ), slots AS (
             SELECT DISTINCT
@@ -84,7 +85,6 @@ def normalized_targets(conn, start, end, k, seed):
     if rows:
         return rows
 
-    # Explicit diagnostic so an empty population is never mistaken for a model result.
     diag = conn.run(
         f"""
         WITH mapping AS ({normalized_mapping_sql()}),
@@ -96,9 +96,9 @@ def normalized_targets(conn, start, end, k, seed):
         ),
         capacity AS (
             SELECT blockface_id::text AS blockface_id,
-                   COUNT(DISTINCT parking_space_id)::int AS capacity
+                   COUNT(DISTINCT COALESCE(parking_space_id::text, post_id::text))::int AS capacity
             FROM parking_meters
-            WHERE blockface_id IS NOT NULL AND parking_space_id IS NOT NULL
+            WHERE blockface_id IS NOT NULL AND post_id IS NOT NULL
             GROUP BY blockface_id
         )
         SELECT
