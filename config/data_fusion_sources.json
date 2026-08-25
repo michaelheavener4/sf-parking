@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "sources": {
+    "parking_meters": {"kind":"socrata","dataset_id":"8vzz-qzz9","url":"https://data.sfgov.org/resource/8vzz-qzz9.json","role":"canonical physical-space inventory"},
+    "meter_policies": {"kind":"socrata","dataset_id":"qq7v-hds4","url":"https://data.sfgov.org/resource/qq7v-hds4.json","role":"operating hours, rates, time limits"},
+    "parking_citations": {"kind":"socrata","dataset_id":"ab4h-6ztd","url":"https://data.sfgov.org/resource/ab4h-6ztd.json","role":"enforcement signal"},
+    "sfpark_sensor_hourly": {"kind":"sfmta_csv","landing_page":"https://www.sfmta.com/getting-around/drive-park/demand-responsive-pricing/sfpark-evaluation","role":"historical physical occupancy target","time_range":"2011-04 through 2013-07"},
+    "sfpark_smart_payments": {"kind":"sfmta_csv","landing_page":"https://www.sfmta.com/getting-around/drive-park/demand-responsive-pricing/sfpark-evaluation","role":"historical transaction feature stream","time_range":"2011-03 through 2013-04"},
+    "sfpark_events": {"kind":"sfmta_csv","landing_page":"https://www.sfmta.com/reports/sfpark-exogenous-evaluation-data","role":"historical demand shocks"},
+    "sfpark_weather": {"kind":"sfmta_csv","landing_page":"https://www.sfmta.com/reports/sfpark-exogenous-evaluation-data","role":"weather / mode-choice context"},
+    "sfpark_roadway_sensors": {"kind":"sfmta_csv","landing_page":"https://www.sfmta.com/getting-around/drive-park/demand-responsive-pricing/sfpark-evaluation","role":"historical traffic signal"},
+    "sfpark_transit": {"kind":"sfmta_csv","landing_page":"https://www.sfmta.com/getting-around/drive-park/demand-responsive-pricing/sfpark-evaluation","role":"historical transit substitution"}
+  },
+  "research_rules": [
+    "PARKING_SPACE_ID is the canonical physical-space join key for current parking inventory.",
+    "Historical sensor occupancy is a target/calibration signal, not a current-day label.",
+    "All predictors must be observable at or before the forecast origin.",
+    "The historical sensor CSV is large and must never be committed to git."
+  ]
+}
