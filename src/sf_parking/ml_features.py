@@ -83,19 +83,28 @@ def _feature_sql() -> str:
 
 
 def _rows_to_df(rows) -> pd.DataFrame:
-    df=pd.DataFrame(rows,columns=["post_id","slot_start","target",*FEATURES_SPATIAL])
-    if df.empty:return df
-    df[FEATURES_SPATIAL]=df[FEATURES_SPATIAL].replace([np.inf,-np.inf],np.nan).fillna(0.0)
+    df = pd.DataFrame(rows, columns=["post_id", "slot_start", "target", *FEATURES_SPATIAL])
+    if df.empty:
+        return df
+    # pg8000/DB adapters can return numerics or CASE expressions as object dtype.
+    # LightGBM accepts only numeric/bool feature columns, so normalize the complete
+    # feature contract at the boundary rather than relying on adapter-specific types.
+    for col in FEATURES_SPATIAL:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[FEATURES_SPATIAL] = df[FEATURES_SPATIAL].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     return df
 
 
-def build_spatial_features(conn, targets: list[tuple], *, config: SpatialFeatureConfig=SpatialFeatureConfig()) -> pd.DataFrame:
-    if not targets:return pd.DataFrame(columns=["post_id","slot_start","target",*FEATURES_SPATIAL])
-    _copy_targets(conn,targets); rows=conn.run(_feature_sql(),max_distance_m=config.max_distance_m,neighbor_k=config.neighbor_k)
-    conn.run("DROP TABLE IF EXISTS _ml_targets"); return _rows_to_df(rows)
+def build_spatial_features(conn, targets: list[tuple], *, config: SpatialFeatureConfig = SpatialFeatureConfig()) -> pd.DataFrame:
+    if not targets:
+        return pd.DataFrame(columns=["post_id", "slot_start", "target", *FEATURES_SPATIAL])
+    _copy_targets(conn, targets)
+    rows = conn.run(_feature_sql(), max_distance_m=config.max_distance_m, neighbor_k=config.neighbor_k)
+    conn.run("DROP TABLE IF EXISTS _ml_targets")
+    return _rows_to_df(rows)
 
 
-def build_spatial_inference_features(conn, slot_start: datetime, *, config: SpatialFeatureConfig=SpatialFeatureConfig()) -> pd.DataFrame:
+def build_spatial_inference_features(conn, slot_start: datetime, *, config: SpatialFeatureConfig = SpatialFeatureConfig()) -> pd.DataFrame:
     """Build future-slot features from the latest completed state only."""
     conn.run("DROP TABLE IF EXISTS _ml_targets")
     conn.run("""
@@ -106,12 +115,13 @@ def build_spatial_inference_features(conn, slot_start: datetime, *, config: Spat
       FROM parking_state_hourly p
       WHERE p.slot_start=:slot::timestamptz-INTERVAL '1 hour'
       ORDER BY p.post_id
-    """,slot=slot_start)
-    rows=conn.run(_feature_sql(),max_distance_m=config.max_distance_m,neighbor_k=config.neighbor_k)
-    conn.run("DROP TABLE IF EXISTS _ml_targets"); return _rows_to_df(rows)
+    """, slot=slot_start)
+    rows = conn.run(_feature_sql(), max_distance_m=config.max_distance_m, neighbor_k=config.neighbor_k)
+    conn.run("DROP TABLE IF EXISTS _ml_targets")
+    return _rows_to_df(rows)
 
 
-def sample_targets(conn,start_slot:datetime,end_slot:datetime,limit_rows:int,seed:int)->list[tuple]:
+def sample_targets(conn, start_slot: datetime, end_slot: datetime, limit_rows: int, seed: int) -> list[tuple]:
     return conn.run("""SELECT post_id,slot_start,paid_availability_probability,meter_type,local_hour,local_date FROM parking_state_hourly
       WHERE slot_start>=:start_slot AND slot_start<=:end_slot AND mod(abs(hashtext(post_id||'|'||slot_start::text||:seed::text)),1000)<50
-      ORDER BY slot_start,post_id LIMIT :limit_rows""",start_slot=start_slot,end_slot=end_slot,seed=str(seed),limit_rows=limit_rows)
+      ORDER BY slot_start,post_id LIMIT :limit_rows""", start_slot=start_slot, end_slot=end_slot, seed=str(seed), limit_rows=limit_rows)
