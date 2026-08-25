@@ -84,6 +84,34 @@ def collect_events(conn,start:date,end:date,per_day:int,seed:int,threshold:float
         part=conn.run(sql,day=day,threshold=threshold,seed=str(seed),limit_rows=per_day); rows.extend(part); print(f"  enriched   {day}: +{len(part):,}; total={len(rows):,}",flush=True); day+=timedelta(days=1)
     return rows[:cap]
 
+def sampled_raw_transition_summary(conn, day: date, limit_rows: int, seed: int, threshold: float) -> dict:
+    """Audit the exact rows selected by sample_day_targets before feature construction."""
+    bucket=max(1,min(999,int((limit_rows/350_000)*1000)))
+    row=conn.run("""
+      WITH sampled AS (
+        SELECT s.post_id,s.slot_start,s.paid_availability_probability y,p.paid_availability_probability prev_y
+        FROM parking_state_hourly s
+        JOIN parking_state_hourly p ON p.post_id=s.post_id AND p.slot_start=s.slot_start-INTERVAL '1 hour'
+        WHERE s.local_date=:day
+          AND mod(abs(hashtext(s.post_id||'|'||s.slot_start::text||:seed::text)),1000)<:bucket
+        ORDER BY s.slot_start,s.post_id
+        LIMIT :limit_rows
+      )
+      SELECT count(*),
+             count(*) FILTER (WHERE abs(y-prev_y)>=:threshold),
+             avg(abs(y-prev_y)),
+             avg((abs(y-prev_y)=0)::int)
+      FROM sampled
+    """,day=day,seed=str(seed),bucket=bucket,limit_rows=limit_rows,threshold=threshold)[0]
+    return {
+        "bucket": int(bucket),
+        "rows_with_exact_prev": int(row[0]),
+        "events": int(row[1]),
+        "event_rate": float(row[1]/row[0]) if row[0] else None,
+        "mean_abs_delta": float(row[2]) if row[2] is not None else None,
+        "unchanged_rate": float(row[3]) if row[3] is not None else None,
+    }
+
 def features(conn,targets,cfg,batch):
     frames=[]
     for i in range(0,len(targets),batch):
@@ -117,10 +145,15 @@ def main():
         seen={(r[0],r[1]) for r in background}; enriched=[r for r in enriched if (r[0],r[1]) not in seen]; train_targets=background+enriched
         val_targets=collect_background(conn,v0,t0-timedelta(days=1),max(1000,math.ceil(args.max_validation_rows/va_days)),63,args.max_validation_rows); test_targets=collect_background(conn,t0,t1,max(1000,math.ceil(args.max_test_rows/te_days)),64,args.max_test_rows)
         print(f"Training={len(train_targets):,} (enriched events={len(enriched):,}); validation={len(val_targets):,}; test={len(test_targets):,}")
+        test_days_seen=sorted({r[5] for r in test_targets})
+        raw_test_summary={str(day):sampled_raw_transition_summary(conn,day, min(350_000,args.max_test_rows),64,args.transition_threshold) for day in test_days_seen}
+        print("raw sampled test transition audit:",json.dumps(raw_test_summary,sort_keys=True))
         cfg=SpatialFeatureConfig(args.neighbor_k,args.neighbor_radius_m); print("[2/4] Leakage-safe features")
         train=features(conn,train_targets,cfg,args.feature_batch_size); val=features(conn,val_targets,cfg,args.feature_batch_size); test=features(conn,test_targets,cfg,args.feature_batch_size)
     finally: conn.close()
     for df in (train,val,test): df["delta"]=df.target-df.lag1_availability
+    feature_test_summary={"rows":int(len(test)),"events":int(np.sum(np.abs(test.delta)>=args.transition_threshold)) if len(test) else 0,"event_rate":float(np.mean(np.abs(test.delta)>=args.transition_threshold)) if len(test) else None,"mean_abs_delta":float(np.mean(np.abs(test.delta))) if len(test) else None,"unchanged_rate":float(np.mean(np.abs(test.delta)==0)) if len(test) else None}
+    print("feature-materialized test transition audit:",json.dumps(feature_test_summary,sort_keys=True))
     print("[3/4] Training event detector + direction + magnitude")
     event,direction,magnitude=fit_models(train,val,args.transition_threshold)
     x=test[FEATURES_SPATIAL]; lag=test.lag1_availability.to_numpy(float); y=test.target.to_numpy(float); actual=y-lag; event_y=(np.abs(actual)>=args.transition_threshold).astype(int)
@@ -135,7 +168,7 @@ def main():
     transitions={str(t):transition_metrics(y,lag,state,t) for t in (.05,.10,.15,.25)}
     for t,r in transitions.items(): print(f"|Δ|>={t}: {r}")
     sm,pm=metric(y,state),metric(y,lag)
-    report={"version":1,"model":"event_direction_magnitude_v1","transition_threshold":args.transition_threshold,"windows":{"train":[str(tr0),str(v0-timedelta(days=1))],"validation":[str(v0),str(t0-timedelta(days=1))],"test":[str(t0),str(t1)]},"rows":{"train":len(train),"validation":len(val),"test":len(test),"enriched_training_events":len(enriched)},"event_detector":er,"direction_accuracy_on_actual_events":da,"persistence":pm,"event_driven_expected_state":sm,"transitions":transitions,"feature_count":len(FEATURES_SPATIAL),"promotion":"candidate" if sm["mae"]<pm["mae"] else "retained_only"}
+    report={"version":2,"model":"event_direction_magnitude_v1","transition_threshold":args.transition_threshold,"windows":{"train":[str(tr0),str(v0-timedelta(days=1))],"validation":[str(v0),str(t0-timedelta(days=1))],"test":[str(t0),str(t1)]},"rows":{"train":len(train),"validation":len(val),"test":len(test),"enriched_training_events":len(enriched)},"raw_sample_test_transition_audit":raw_test_summary,"feature_test_transition_audit":feature_test_summary,"event_detector":er,"direction_accuracy_on_actual_events":da,"persistence":pm,"event_driven_expected_state":sm,"transitions":transitions,"feature_count":len(FEATURES_SPATIAL),"promotion":"candidate" if sm["mae"]<pm["mae"] else "retained_only"}
     OUT.parent.mkdir(parents=True,exist_ok=True); OUT.write_text(json.dumps(report,indent=2,default=str)); print(f"Report: {OUT}"); return 0
 
 if __name__=="__main__": raise SystemExit(main())
