@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "purpose": "Canonical source registry for parking dynamics research.",
+  "sources": {
+    "parking_meters": {
+      "kind": "socrata",
+      "dataset_id": "8vzz-qzz9",
+      "url": "https://data.sfgov.org/resource/8vzz-qzz9.json",
+      "role": "physical parking-space inventory and canonical PARKING_SPACE_ID/POST_ID/BLOCKFACE_ID mapping"
+    },
+    "meter_policies": {
+      "kind": "socrata",
+      "dataset_id": "qq7v-hds4",
+      "url": "https://data.sfgov.org/resource/qq7v-hds4.json",
+      "role": "time-varying operating hours, rates and time limits"
+    },
+    "parking_citations": {
+      "kind": "socrata",
+      "dataset_id": "ab4h-6ztd",
+      "url": "https://data.sfgov.org/resource/ab4h-6ztd.json",
+      "role": "enforcement / curb-behavior exogenous signal"
+    },
+    "sfpark_sensor_hourly": {
+      "kind": "sfmta_csv",
+      "landing_page": "https://www.sfmta.com/getting-around/drive-park/demand-responsive-pricing/sfpark-evaluation",
+      "filename": "SFpark_ ParkingSensorData_HourlyOccupancy_20112013.csv",
+      "role": "historical physical occupancy ground truth / calibration target",
+      "time_range": "2011-04 through 2013-07"
+    },
+    "sfpark_events": {
+      "kind": "sfmta_csv",
+      "landing_page": "https://www.sfmta.com/reports/sfpark-exogenous-evaluation-data",
+      "role": "historical demand shocks"
+    },
+    "sfpark_weather": {
+      "kind": "sfmta_csv",
+      "landing_page": "https://www.sfmta.com/reports/sfpark-exogenous-evaluation-data",
+      "role": "historical weather / mode-choice context"
+    },
+    "sfpark_roadway_sensor": {
+      "kind": "sfmta_csv",
+      "landing_page": "https://www.sfmta.com/getting-around/drive-park/demand-responsive-pricing/sfpark-evaluation",
+      "role": "historical leading traffic signal"
+    },
+    "sfpark_transit": {
+      "kind": "sfmta_csv",
+      "landing_page": "https://www.sfmta.com/getting-around/drive-park/demand-responsive-pricing/sfpark-evaluation",
+      "role": "historical transit substitution signal"
+    }
+  },
+  "notes": [
+    "The historical sensor CSV is large; import it from a local file with the dedicated importer rather than downloading it into git.",
+    "The current public SFpark availability API is documented historically by SFMTA; this branch does not assume the legacy endpoint remains live.",
+    "All model features must obey forecast-as-of timestamps; no future sensor/session/policy data may be used.",
+    "PARKING_SPACE_ID is the canonical physical-space join key in the current Parking Meters dataset."
+  ]
+}
