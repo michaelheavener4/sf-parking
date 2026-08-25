@@ -37,7 +37,8 @@ def _feature_sql() -> str:
       SELECT t.*,m.location FROM _ml_targets t JOIN parking_meters m ON m.post_id=t.post_id WHERE m.location IS NOT NULL
     ), temporal AS (
       SELECT b.*,p1.paid_availability_probability lag1,p2.paid_availability_probability lag2,p3.paid_availability_probability lag3,
-             p6.paid_availability_probability lag6,p24.paid_availability_probability lag24,p168.paid_availability_probability lag168,
+             p6.paid_availability_probability lag6,p24.paid_availability_probability lag24,
+             COALESCE(p168.paid_availability_probability,p24.paid_availability_probability) lag168,
              COALESCE(p1.transaction_count,0) tx1,COALESCE(p24.transaction_count,0) tx24
       FROM base b
       JOIN parking_state_hourly p1 ON p1.post_id=b.post_id AND p1.slot_start=b.slot_start-INTERVAL '1 hour'
@@ -45,7 +46,7 @@ def _feature_sql() -> str:
       JOIN parking_state_hourly p3 ON p3.post_id=b.post_id AND p3.slot_start=b.slot_start-INTERVAL '3 hours'
       JOIN parking_state_hourly p6 ON p6.post_id=b.post_id AND p6.slot_start=b.slot_start-INTERVAL '6 hours'
       JOIN parking_state_hourly p24 ON p24.post_id=b.post_id AND p24.slot_start=b.slot_start-INTERVAL '24 hours'
-      JOIN parking_state_hourly p168 ON p168.post_id=b.post_id AND p168.slot_start=b.slot_start-INTERVAL '168 hours'
+      LEFT JOIN parking_state_hourly p168 ON p168.post_id=b.post_id AND p168.slot_start=b.slot_start-INTERVAL '168 hours'
     ), neighbors AS (
       SELECT t.post_id,t.slot_start,n.post_id neighbor_post_id,ST_Distance(n.location,t.location) distance_m
       FROM temporal t CROSS JOIN LATERAL (
