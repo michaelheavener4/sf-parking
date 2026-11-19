@@ -18,9 +18,9 @@ V0.1 intentionally does **not** claim live occupancy. The SFMTA meter inventory 
 
 ## Data sources
 
-- SFMTA Parking Meters — DataSF dataset `8vzz-qzz9`
-- SFMTA Meter Policies — DataSF dataset `qq7v-hds4`
-- SFMTA Parking Regulations — DataSF dataset `hi6h-neyh` (supplemental; not treated as authoritative)
+- SFMTA Parking Meters: DataSF dataset `8vzz-qzz9`
+- SFMTA Meter Policies: DataSF dataset `qq7v-hds4`
+- SFMTA Parking Regulations: DataSF dataset `hi6h-neyh` (supplemental; not treated as authoritative)
 
 ## Architecture
 
@@ -73,7 +73,7 @@ overridden with the `DATABASE_URL` environment variable.
 Nearby-meter geographic queries available via
 `sf_parking.database.find_meters_near(latitude, longitude, radius_meters)`.
 A deterministic baseline availability score (not yet calibrated) is
-available via `sf_parking.features` — see docs/PARKING_STATE.md. A
+available via `sf_parking.features` (see docs/PARKING_STATE.md). A
 point-in-time-safe backtesting harness measures it against a documented
 paid-session proxy: `python3 -m sf_parking.backtest --help` (see
 docs/BACKTESTING.md).

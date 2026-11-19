@@ -11,7 +11,7 @@ Module: `sf_parking.backtest` · CLI: `python3 -m sf_parking.backtest --help`
 This is strictly a **measurement** milestone: the V0 baseline formula is not
 modified here, and nothing in this framework is a calibrated probability.
 
-## Target definition — three explicitly distinct levels
+## Target definition: three explicitly distinct levels
 
 | Level | What it is | Status |
 |---|---|---|
@@ -34,7 +34,7 @@ local clock hours (default all 24). Each observation is one absolute
 clock-hour slot `[T, T+1h)`.
 
 Slots before a meter's first-ever session are skipped (`skipped_no_history`)
-rather than scored "free" — absence of history is never interpreted as
+rather than scored "free", because absence of history is never interpreted as
 absence of cars.
 
 ## Leakage rules (enforced, tested)
@@ -46,13 +46,13 @@ A prediction for slot starting at instant T may use:
   because an ongoing session's eventual end is unknowable at T;
 - meter geometry/blockface exclusively from `meter_placements` rows whose
   validity range contains T (point-in-time lookup against the canonical
-  temporal table) — later inventory snapshots cannot leak backwards;
+  temporal table), so later inventory snapshots cannot leak backwards;
 - static attributes recorded before T (meter_type).
 
 It may never use:
 
 - transactions occurring at or after T (including ones *inside* the predicted
-  hour — they legitimately appear in the outcome, never in the prediction);
+  hour; they legitimately appear in the outcome, never in the prediction);
 - untruncated session ends;
 - placement/inventory rows valid only after T;
 - any feature derived from future data.
@@ -89,7 +89,7 @@ Breakdowns: local hour, weekday, meter type, point-in-time blockface, and
 evidence-depth buckets (`1`, `2–3`, `4–7`, `8–14`, `15+` days).
 
 Cells with fewer than `--min-samples` observations (default 30) report only
-their count with `"suppressed": true` — no metrics are calculated on thin
+their count with `"suppressed": true`; no metrics are calculated on thin
 slices.
 
 ## DST / timezone semantics
@@ -109,7 +109,7 @@ Same database state + same parameters ⇒ byte-identical serialized JSON
 `method_version`, `cutoff`, evidence counts, and provenance sufficient to
 recompute them.
 
-## Limitations — read before quoting numbers
+## Limitations (read before quoting numbers)
 
 1. Proxy ≠ ground truth (see above); scores are upper bounds on quality.
 2. The baseline is not a calibrated probability; calibration tables describe

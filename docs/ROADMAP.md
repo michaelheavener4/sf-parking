@@ -1,13 +1,13 @@
-# SF Parking Intelligence — Roadmap
+# SF Parking Intelligence: Roadmap
 
-## V0.1 — Inventory + policies (done)
+## V0.1: Inventory + policies (done)
 
 - 38,711 SFMTA parking meters in PostGIS (`parking_meters`, joined by `post_id`).
 - 890,495 meter policy records (`meter_policies`), idempotent loads.
 - Geographic queries: `find_meters_near(lat, lon, radius_m)`.
 - Repeatable DataSF download/normalize pipeline into `data/raw/*.jsonl`.
 
-## V0.2 — Generic ingestion framework + provenance (current, issue #1)
+## V0.2: Generic ingestion framework + provenance (current, issue #1)
 
 Turn one-off ingestion scripts into a reusable data platform layer:
 
@@ -32,7 +32,7 @@ wall-clock times with **no UTC offset**, reported on SFMTA's operating clock,
 1. DataSF/Socrata define floating timestamps as agency-local time; SFMTA
    operates in San Francisco.
 2. Observed distribution over 320k real sessions peaks at 09:00–16:00 with a
-   hard stop at 18:00 — exactly SF metered hours on a Pacific clock.
+   hard stop at 18:00, matching SF metered hours on a Pacific clock.
    Interpreted as UTC they would fall at ~2–11 AM Pacific.
 3. The inventory dataset's `data_as_of` (floating) vs `data_loaded_at`
    (Socrata load time) differ by roughly the Pacific offset plus lag.
@@ -78,7 +78,7 @@ Implications for inference work: sessions can be joined to locations through
 new meters rather than data corruption, and all temporal features must be
 computed in America/Los_Angeles time.
 
-## V0.3 — Canonical spatial/temporal model (current)
+## V0.3: Canonical spatial/temporal model (current)
 
 Foundation for treating sf-parking as a general SF urban data platform:
 
@@ -89,7 +89,7 @@ Foundation for treating sf-parking as a general SF urban data platform:
       carry validity ranges + exclusion constraints; inventory snapshots
       close superseded placements instead of overwriting history.
 - [x] Projections run through the generic ingestion framework as derived
-      sources (`canonical_projection:*`) — provenance, idempotency and
+      sources (`canonical_projection:*`), with provenance, idempotency and
       health reporting identical to external adapters
       (`scripts/project_canonical.py`).
 - [x] Unresolved identity is modelled honestly:
@@ -105,7 +105,7 @@ Foundation for treating sf-parking as a general SF urban data platform:
 - [ ] Policy-aware availability (blocked: DataSF emptied qq7v-hds4 on
       2026-08-24; awaiting republish or replacement dataset).
 
-## V0.4 — More sources (planned)
+## V0.4: More sources (planned)
 
 Adapters to add without touching core loading code:
 
@@ -117,12 +117,12 @@ Adapters to add without touching core loading code:
 
 Migrate meters/policies JSONL snapshot loads onto the framework.
 
-## V0.5 — API + UI
+## V0.5: API + UI
 
 Nearby-parking API combining inventory, live policy state and observed
 demand; map/web client.
 
-## V0.6 — Prediction (ML)
+## V0.6: Prediction (ML)
 
 Occupancy/demand estimation from accumulated transaction history.
-Explicitly **not** before real observation data exists — no synthetic data.
+Explicitly **not** before real observation data exists (no synthetic data).

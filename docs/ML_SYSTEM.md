@@ -1,4 +1,4 @@
-# SF Parking Intelligence — ML System
+# SF Parking Intelligence: ML System
 
 This document defines the production ML path beyond the original 15-feature LightGBM.
 
@@ -10,10 +10,10 @@ The optimization target is not merely meter-level MAE. The product objective is:
 
 The system therefore has four layers:
 
-1. State estimation — infer paid-state availability from observed transactions.
-2. Forecasting — predict future meter/block neighborhood state.
-3. Calibration — make probability values empirically trustworthy.
-4. Decision ranking — convert predictions into the best parking action.
+1. State estimation: infer paid-state availability from observed transactions.
+2. Forecasting: predict future meter/block neighborhood state.
+3. Calibration: make probability values empirically trustworthy.
+4. Decision ranking: convert predictions into the best parking action.
 
 ## Model ladder
 

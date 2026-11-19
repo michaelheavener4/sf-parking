@@ -3,7 +3,7 @@
 ## Why the curb/blockface is the foundation, not the meter
 
 A meter is a **device**: it can be installed, moved, replaced, or removed
-while the place it serves — a stretch of curb where vehicles may stop —
+while the place it serves (a stretch of curb where vehicles may stop)
 persists. Modelling meters as the geographic root makes history unreadable:
 when a meter moves 20 metres, the old model loses the fact that *the same
 curb space* was regulated before, during, and after. The canonical hierarchy
@@ -27,7 +27,7 @@ source itself asserts it.
 |---|---|---|---|
 | `streets` | named street | none | inventory `street_id` + `street_name` |
 | `blockfaces` | one side of a street between intersections | none yet | inventory `blockface_id` (+ same-row `street_id`, `street_seg_ctrln_id`) |
-| `curb_segments` | stretch of curb inside a blockface | optional LineString | **unpopulated** — no SFMTA dataset resolves sub-blockface curbs |
+| `curb_segments` | stretch of curb inside a blockface | optional LineString | **unpopulated**: no SFMTA dataset resolves sub-blockface curbs |
 | `parking_spaces` | individual parkable space | optional Point | policies `parkingspaceid` |
 | `meters` | payment-device identity | none | inventory `post_id` |
 | `meter_placements` | where a meter stood, over time | Point (from inventory lat/lon) | inventory rows |
@@ -50,7 +50,7 @@ source itself asserts it.
 
 Fields that look like identifiers but are deliberately **not** mapped as
 such: `objectid` (DataSF portal row id, changes on reload), `osp_id`
-(off-street facilities — out of scope), `ms_pay_station_id`/`ms_space_num`
+(off-street facilities, out of scope), `ms_pay_station_id`/`ms_space_num`
 (multi-space pay-station internals, retained in raw data only).
 
 ## Temporal design
@@ -70,7 +70,7 @@ such: `objectid` (DataSF portal row id, changes on reload), `osp_id`
 Canonical surrogate keys (`*_id bigint identity`) are internal. Source ids
 are preserved verbatim (`source_*_id`). Historical transaction post_ids that
 match no canonical meter remain visible in
-`v_unresolved_transaction_posts` — they are honest observations of retired
+`v_unresolved_transaction_posts`: they are honest observations of retired
 or future meters, never deleted or re-mapped by geography.
 
 ## Known limitations (documented, not hidden)

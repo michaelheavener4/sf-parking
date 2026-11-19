@@ -26,7 +26,7 @@ Durations always come from absolute instants, so sessions crossing DST
 transitions count real elapsed time (a 00:30–04:30 PT session on fall-back
 day is 300 minutes, not 240).
 
-Meters with no completed sessions in the window are omitted — absence is not
+Meters with no completed sessions in the window are omitted; absence is not
 modelled as zero activity.
 
 ## Baseline availability (`availability_baseline`)
@@ -47,7 +47,7 @@ For meter *m* and instant *T*:
 If the meter has **no completed sessions** in the window, `score is None`
 (`insufficient history`) rather than a fabricated number.
 
-## Assumptions & caveats — read before using scores
+## Assumptions & caveats (read before using scores)
 
 * **Not a calibrated probability.** The score is a transparent occupancy
   ratio. It has no probabilistic interpretation and has not been validated
@@ -130,7 +130,7 @@ With `evidence_halflife = 14` (default):
 ### Design rationale
 
 With ~1 week of transaction history, per-meter hourly estimates rest
-on at most ~7 observations — far too few for stable ratios. A
+on at most ~7 observations, far too few for stable ratios. A
 blockface with 10 meters gains ~70 observations per hour cell. The
 blending weight naturally handles the cold-start / shallow-history
 problem: meters with little data lean on the blockface average; meters
